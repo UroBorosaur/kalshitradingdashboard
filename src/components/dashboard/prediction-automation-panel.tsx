@@ -597,7 +597,7 @@ export function PredictionAutomationPanel() {
                 </div>
               ) : attribution ? (
                 <div className="space-y-3">
-                  <div className="grid gap-2 text-[11px] text-slate-300 md:grid-cols-5">
+                  <div className="grid gap-2 text-[11px] text-slate-300 md:grid-cols-6">
                     <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                       <p className="text-slate-500">Decisions / Placed</p>
                       <p className="font-semibold">
@@ -624,6 +624,15 @@ export function PredictionAutomationPanel() {
                       <p className="text-slate-500">Expiry Markout</p>
                       <p className="font-semibold">{formatPercent(attribution.totals.avgMarkoutExpiry)}</p>
                     </div>
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-slate-500">Balance Reconciliation</p>
+                      <p className="font-semibold">
+                        {attribution.totals.matchedReconciliations}/{attribution.totals.placed} matched
+                      </p>
+                      <p className="text-slate-400">
+                        Drift {formatUsd(attribution.totals.avgCashDeltaDriftUsd)} | Fee {formatUsd(attribution.totals.avgFeeDriftUsd)}
+                      </p>
+                    </div>
                   </div>
 
                   <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
@@ -641,7 +650,7 @@ export function PredictionAutomationPanel() {
                           group.rows.map((row) => (
                             <p key={`${group.label}-${row.key}`} className="mt-1 text-[11px] text-slate-300">
                               {row.label} | {row.placed}/{row.decisions} placed | 30s {formatPercent(row.avgMarkout30s)} | expiry{" "}
-                              {formatPercent(row.avgMarkoutExpiry)}
+                              {formatPercent(row.avgMarkoutExpiry)} | drift {formatUsd(row.avgCashDeltaDriftUsd)}
                             </p>
                           ))
                         ) : (
@@ -659,7 +668,9 @@ export function PredictionAutomationPanel() {
                           {trade.ticker} {trade.side} | {trade.executionStatus} | {trade.dominantExpert} | {trade.executionHealthRegime} |{" "}
                           {trade.bootstrapMode} | edge {formatPercent(trade.edge)} | exec {formatPercent(trade.executionAdjustedEdge)} | 30s{" "}
                           {formatPercent(trade.markout30s)} | expiry {formatPercent(trade.markoutExpiry)} | tox {formatPercent(trade.toxicityScore)} |{" "}
-                          uncert {formatPercent(trade.uncertaintyWidth)} | inv {formatNumber(trade.inventorySkew)}
+                          uncert {formatPercent(trade.uncertaintyWidth)} | inv {formatNumber(trade.inventorySkew)} | cash {formatUsd(
+                            trade.actualCashDeltaUsd,
+                          )} | drift {formatUsd(trade.cashDeltaDriftUsd)} | fee {formatUsd(trade.inferredActualFeeUsd)}
                         </p>
                       ))
                     ) : (

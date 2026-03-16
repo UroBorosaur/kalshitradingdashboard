@@ -32,6 +32,9 @@ export async function GET() {
     const seededSummary = await getKalshiLiveSummaryStream([]);
     const { orders, fills, positions, quotes, stream } = seededSummary;
     await persistKalshiSummarySnapshot({
+      balanceUsd: balances.cashUsd ?? balances.portfolioUsd ?? null,
+      cashUsd: balances.cashUsd ?? balances.portfolioUsd ?? null,
+      portfolioUsd: balances.portfolioUsd ?? balances.cashUsd ?? null,
       orders,
       fills,
       positions,

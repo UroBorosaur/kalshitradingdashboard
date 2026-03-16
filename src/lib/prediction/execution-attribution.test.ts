@@ -5,6 +5,7 @@ import { summarizeExecutionAttribution } from "@/lib/prediction/execution-attrib
 import type {
   PredictionStorageEnvelope,
   StoredCandidateDecisionEvent,
+  StoredKalshiBalanceEvent,
   StoredKalshiFillEvent,
   StoredKalshiOrderEvent,
   StoredMarkoutEvent,
@@ -50,7 +51,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
         edge: 0.03,
         executionAdjustedEdge: 0.025,
         confidence: 0.66,
-        recommendedStakeUsd: 12.2,
+        recommendedStakeUsd: 1.22,
         recommendedContracts: 2,
         limitPriceCents: 61,
         probabilityTransform: "ENTMAX15",
@@ -61,6 +62,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
         ],
         compositeScore: 0.012,
         netAlphaUsd: 0.47,
+        feeEstimateUsd: 0.02,
         uncertaintyWidth: 0.03,
         toxicityScore: 0.24,
         riskCluster: "SPORTS:TEST-EVENT",
@@ -166,6 +168,31 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     ),
   ];
 
+  const balances = [
+    envelope<StoredKalshiBalanceEvent>(
+      "balances",
+      "automation/pre-run-balance",
+      "balance:before",
+      {
+        balanceUsd: 100,
+        cashUsd: 100,
+        portfolioUsd: 0,
+      },
+      "2026-03-16T11:59:00.000Z",
+    ),
+    envelope<StoredKalshiBalanceEvent>(
+      "balances",
+      "automation/post-run-balance",
+      "balance:after",
+      {
+        balanceUsd: 98.76,
+        cashUsd: 98.76,
+        portfolioUsd: 1.22,
+      },
+      "2026-03-16T12:01:00.000Z",
+    ),
+  ];
+
   const markouts = [
     envelope<StoredMarkoutEvent>(
       "markouts",
@@ -225,6 +252,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     decisions,
     orders,
     fills,
+    balances,
     markouts,
     recentTradeLimit: 10,
     bucketLimit: 10,
@@ -237,6 +265,9 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.totals.avgMarkout30s, 0.03);
   assert.equal(summary.totals.avgMarkout2m, 0.05);
   assert.equal(summary.totals.avgMarkoutExpiry, 0.39);
+  assert.equal(summary.totals.matchedReconciliations, 1);
+  assert.equal(summary.totals.avgCashDeltaDriftUsd, 0);
+  assert.equal(summary.totals.avgFeeDriftUsd, 0);
 
   const byExpert = summary.byExpert.find((row) => row.key === "MICROSTRUCTURE");
   assert.ok(byExpert);
@@ -253,4 +284,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(firstTrade.bootstrapMode, "ACKED");
   assert.equal(firstTrade.markoutExpiry, 0.39);
   assert.equal(firstTrade.averageFillPriceCents, 61);
+  assert.equal(firstTrade.actualCashDeltaUsd, 1.24);
+  assert.equal(firstTrade.cashDeltaDriftUsd, 0);
+  assert.equal(firstTrade.inferredActualFeeUsd, 0.02);
 });

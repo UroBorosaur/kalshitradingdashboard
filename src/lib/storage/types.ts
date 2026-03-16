@@ -16,6 +16,7 @@ export type PredictionStorageStream =
   | "stream_events"
   | "fills"
   | "orders"
+  | "balances"
   | "positions"
   | "quotes"
   | "orderbook_events"
@@ -75,6 +76,12 @@ export interface StoredKalshiOrderEvent {
   createdTime?: string;
   expirationTime?: string;
   lastUpdateTime?: string;
+}
+
+export interface StoredKalshiBalanceEvent {
+  balanceUsd?: number | null;
+  cashUsd?: number | null;
+  portfolioUsd?: number | null;
 }
 
 export interface StoredKalshiPositionEvent {
@@ -221,6 +228,7 @@ export interface PredictionReplayDay {
   streamEvents: Array<PredictionStorageEnvelope<StoredKalshiStreamEvent>>;
   fills: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>>;
   orders: Array<PredictionStorageEnvelope<StoredKalshiOrderEvent>>;
+  balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>;
   positions: Array<PredictionStorageEnvelope<StoredKalshiPositionEvent>>;
   quotes: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>;
   orderbookEvents: Array<PredictionStorageEnvelope<StoredOrderbookEvent>>;
@@ -233,6 +241,7 @@ export type PredictionReplayEvent =
   | PredictionStorageEnvelope<StoredKalshiStreamEvent>
   | PredictionStorageEnvelope<StoredKalshiFillEvent>
   | PredictionStorageEnvelope<StoredKalshiOrderEvent>
+  | PredictionStorageEnvelope<StoredKalshiBalanceEvent>
   | PredictionStorageEnvelope<StoredKalshiPositionEvent>
   | PredictionStorageEnvelope<StoredKalshiQuoteEvent>
   | PredictionStorageEnvelope<StoredOrderbookEvent>

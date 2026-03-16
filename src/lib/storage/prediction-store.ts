@@ -15,6 +15,7 @@ import type {
   PredictionReplayEvent,
   PredictionStorageEnvelope,
   StoredCandidateDecisionEvent,
+  StoredKalshiBalanceEvent,
   StoredKalshiFillEvent,
   StoredKalshiOrderEvent,
   StoredKalshiPositionEvent,
@@ -244,6 +245,19 @@ function normalizePositionPayload(position: KalshiPositionLite): StoredKalshiPos
   };
 }
 
+function normalizeBalancePayload(args: {
+  balanceUsd?: number | null;
+  cashUsd?: number | null;
+  portfolioUsd?: number | null;
+}): StoredKalshiBalanceEvent {
+  return {
+    balanceUsd: typeof args.balanceUsd === "number" && Number.isFinite(args.balanceUsd) ? Number(args.balanceUsd.toFixed(4)) : null,
+    cashUsd: typeof args.cashUsd === "number" && Number.isFinite(args.cashUsd) ? Number(args.cashUsd.toFixed(4)) : null,
+    portfolioUsd:
+      typeof args.portfolioUsd === "number" && Number.isFinite(args.portfolioUsd) ? Number(args.portfolioUsd.toFixed(4)) : null,
+  };
+}
+
 function normalizeOrderbookPayload(market: PredictionMarketQuote): StoredOrderbookEvent {
   return {
     ticker: market.ticker.toUpperCase(),
@@ -279,6 +293,9 @@ async function withState<T>(fn: (state: PredictionIngestionState) => Promise<T>)
 }
 
 export async function persistKalshiSummarySnapshot(args: {
+  balanceUsd?: number | null;
+  cashUsd?: number | null;
+  portfolioUsd?: number | null;
   orders: KalshiOrderLite[];
   fills: KalshiFillLite[];
   positions: KalshiPositionLite[];
@@ -289,9 +306,23 @@ export async function persistKalshiSummarySnapshot(args: {
     const nowMs = Date.now();
     const orderEvents: Array<PredictionStorageEnvelope<StoredKalshiOrderEvent>> = [];
     const fillEvents: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>> = [];
+    const balanceEvents: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>> = [];
     const positionEvents: Array<PredictionStorageEnvelope<StoredKalshiPositionEvent>> = [];
     const quoteEvents: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>> = [];
     const resolutionEvents: Array<PredictionStorageEnvelope<StoredResolutionEvent>> = [];
+
+    const balancePayload = normalizeBalancePayload({
+      balanceUsd: args.balanceUsd,
+      cashUsd: args.cashUsd,
+      portfolioUsd: args.portfolioUsd,
+    });
+    if (
+      balancePayload.balanceUsd !== null ||
+      balancePayload.cashUsd !== null ||
+      balancePayload.portfolioUsd !== null
+    ) {
+      balanceEvents.push(makeEnvelope("balances", "raw", args.source, `balance:${nowMs}`, balancePayload));
+    }
 
     for (const order of args.orders) {
       const payload = normalizeOrderPayload(order);
@@ -349,11 +380,25 @@ export async function persistKalshiSummarySnapshot(args: {
     await Promise.all([
       appendPredictionEvents("raw", "orders", orderEvents),
       appendPredictionEvents("raw", "fills", fillEvents),
+      appendPredictionEvents("raw", "balances", balanceEvents),
       appendPredictionEvents("raw", "positions", positionEvents),
       appendPredictionEvents("raw", "quotes", quoteEvents),
       appendPredictionEvents("raw", "resolutions", resolutionEvents),
     ]);
   });
+}
+
+export async function persistKalshiBalanceSnapshot(args: {
+  balanceUsd?: number | null;
+  cashUsd?: number | null;
+  portfolioUsd?: number | null;
+  source: string;
+}) {
+  const payload = normalizeBalancePayload(args);
+  if (payload.balanceUsd === null && payload.cashUsd === null && payload.portfolioUsd === null) return;
+  await appendPredictionEvents("raw", "balances", [
+    makeEnvelope("balances", "raw", args.source, `balance:${Date.now()}`, payload),
+  ]);
 }
 
 export async function persistMarketScan(args: {
@@ -460,6 +505,10 @@ export async function readStoredFillsSince(sinceMs: number) {
   return readPredictionEventsSince<StoredKalshiFillEvent>("raw", "fills", sinceMs);
 }
 
+export async function readStoredBalancesSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredKalshiBalanceEvent>("raw", "balances", sinceMs);
+}
+
 export async function persistMarkoutEvents(
   source: string,
   markouts: StoredMarkoutEvent[],
@@ -481,6 +530,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     streamEvents,
     fills,
     orders,
+    balances,
     positions,
     quotes,
     orderbookEvents,
@@ -491,6 +541,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     readPredictionEventsForDay<StoredKalshiStreamEvent>("raw", "stream_events", day),
     readPredictionEventsForDay<StoredKalshiFillEvent>("raw", "fills", day),
     readPredictionEventsForDay<StoredKalshiOrderEvent>("raw", "orders", day),
+    readPredictionEventsForDay<StoredKalshiBalanceEvent>("raw", "balances", day),
     readPredictionEventsForDay<StoredKalshiPositionEvent>("raw", "positions", day),
     readPredictionEventsForDay<StoredKalshiQuoteEvent>("raw", "quotes", day),
     readPredictionEventsForDay<StoredOrderbookEvent>("raw", "orderbook_events", day),
@@ -503,6 +554,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     streamEvents,
     fills,
     orders,
+    balances,
     positions,
     quotes,
     orderbookEvents,
@@ -516,12 +568,13 @@ const REPLAY_STREAM_ORDER: Record<PredictionReplayEvent["stream"], number> = {
   stream_events: 0,
   fills: 1,
   orders: 2,
-  positions: 3,
-  quotes: 4,
-  orderbook_events: 5,
-  candidate_decisions: 6,
-  resolutions: 7,
-  markouts: 8,
+  balances: 3,
+  positions: 4,
+  quotes: 5,
+  orderbook_events: 6,
+  candidate_decisions: 7,
+  resolutions: 8,
+  markouts: 9,
 };
 
 function compareReplayEvents(a: PredictionReplayEvent, b: PredictionReplayEvent) {
@@ -545,6 +598,7 @@ export async function loadPredictionReplayTimeline(day: string): Promise<Predict
     ...replayDay.streamEvents,
     ...replayDay.fills,
     ...replayDay.orders,
+    ...replayDay.balances,
     ...replayDay.positions,
     ...replayDay.quotes,
     ...replayDay.orderbookEvents,

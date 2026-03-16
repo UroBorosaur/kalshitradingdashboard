@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { getOptionChainSnapshots, getStockSnapshots } from "@/lib/live/alpaca";
 import {
   getKalshiDemoBalanceUsd,
+  getKalshiDemoBalancesUsd,
   kalshiConnectionStatus,
   placeKalshiDemoOrder,
 } from "@/lib/prediction/kalshi";
@@ -20,7 +21,7 @@ import {
   snapProbabilityToMarket,
 } from "@/lib/prediction/fixed-point";
 import { refreshMarkoutTelemetry } from "@/lib/prediction/markouts";
-import { persistCandidateDecisions, persistMarketScan } from "@/lib/storage/prediction-store";
+import { persistCandidateDecisions, persistKalshiBalanceSnapshot, persistMarketScan } from "@/lib/storage/prediction-store";
 import {
   entmaxBisect,
   logit,
@@ -4110,6 +4111,14 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const openPositionConstraint = buildOpenPositionConstraint(existingPositions, existingOrders);
   const bootstrapMode = deriveBootstrapMode();
 
+  const initialBalances = await getKalshiDemoBalancesUsd().catch(() => ({ cashUsd: null, portfolioUsd: null }));
+  await persistKalshiBalanceSnapshot({
+    balanceUsd: initialBalances.cashUsd ?? initialBalances.portfolioUsd ?? null,
+    cashUsd: initialBalances.cashUsd ?? initialBalances.portfolioUsd ?? null,
+    portfolioUsd: initialBalances.portfolioUsd ?? initialBalances.cashUsd ?? null,
+    source: "automation/pre-run-balance",
+  }).catch(() => undefined);
+
   const warnings: string[] = [];
   if (!btcSpot) warnings.push("BTC spot feed unavailable; using order-book fallback model for bitcoin contracts.");
   if (!account.fromBroker) warnings.push("Kalshi balance unavailable; using conservative placeholder balance for planning.");
@@ -4549,6 +4558,16 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     source: "automation/executed-candidates",
   }).catch(() => {
     warnings.push("Storage warning: failed to persist executed candidate decisions.");
+  });
+
+  const finalBalances = await getKalshiDemoBalancesUsd().catch(() => ({ cashUsd: null, portfolioUsd: null }));
+  await persistKalshiBalanceSnapshot({
+    balanceUsd: finalBalances.cashUsd ?? finalBalances.portfolioUsd ?? null,
+    cashUsd: finalBalances.cashUsd ?? finalBalances.portfolioUsd ?? null,
+    portfolioUsd: finalBalances.portfolioUsd ?? finalBalances.cashUsd ?? null,
+    source: "automation/post-run-balance",
+  }).catch(() => {
+    warnings.push("Storage warning: failed to persist post-run balance snapshot.");
   });
 
   if (input.execute && !kalshi.connected) {

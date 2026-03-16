@@ -266,6 +266,7 @@ export interface ExecutionAttributionBucket {
   avgMarkout30s: number | null;
   avgMarkout2m: number | null;
   avgMarkoutExpiry: number | null;
+  avgCashDeltaDriftUsd?: number | null;
 }
 
 export interface ExecutionAttributionTrade {
@@ -304,6 +305,17 @@ export interface ExecutionAttributionTrade {
   markout30s: number | null;
   markout2m: number | null;
   markoutExpiry: number | null;
+  balanceBeforeCashUsd: number | null;
+  balanceAfterCashUsd: number | null;
+  balanceBeforePortfolioUsd: number | null;
+  balanceAfterPortfolioUsd: number | null;
+  expectedExecutionCostUsd: number | null;
+  actualCashDeltaUsd: number | null;
+  inferredActualFeeUsd: number | null;
+  estimatedFeeUsd: number | null;
+  feeDriftUsd: number | null;
+  cashDeltaDriftUsd: number | null;
+  reconciliationMatched: boolean;
 }
 
 export interface ExecutionAttributionSummary {
@@ -320,6 +332,9 @@ export interface ExecutionAttributionSummary {
     avgMarkout30s: number | null;
     avgMarkout2m: number | null;
     avgMarkoutExpiry: number | null;
+    matchedReconciliations: number;
+    avgCashDeltaDriftUsd: number | null;
+    avgFeeDriftUsd: number | null;
   };
   byExpert: ExecutionAttributionBucket[];
   byExecutionHealth: ExecutionAttributionBucket[];

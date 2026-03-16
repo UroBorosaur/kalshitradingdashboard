@@ -1,8 +1,9 @@
 import "@/lib/server-only";
 
-import { readStoredCandidateDecisionsSince, readStoredFillsSince, readStoredMarkoutsSince, readStoredOrdersSince } from "@/lib/storage/prediction-store";
+import { readStoredBalancesSince, readStoredCandidateDecisionsSince, readStoredFillsSince, readStoredMarkoutsSince, readStoredOrdersSince } from "@/lib/storage/prediction-store";
 import type {
   PredictionStorageEnvelope,
+  StoredKalshiBalanceEvent,
   StoredCandidateDecisionEvent,
   StoredKalshiFillEvent,
   StoredKalshiOrderEvent,
@@ -16,6 +17,7 @@ import type {
   ExecutionHealthRegime,
   PredictionSide,
 } from "@/lib/prediction/types";
+import { reconcileKalshiExecution } from "@/lib/prediction/reconciliation";
 
 const EXECUTED_CANDIDATE_SOURCE = "automation/executed-candidates";
 const DEFAULT_LOOKBACK_HOURS = 72;
@@ -31,6 +33,7 @@ interface SummarizeExecutionAttributionArgs {
   decisions: Array<PredictionStorageEnvelope<StoredCandidateDecisionEvent>>;
   orders: Array<PredictionStorageEnvelope<StoredKalshiOrderEvent>>;
   fills: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>>;
+  balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>;
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
 
@@ -52,6 +55,11 @@ interface BucketAccumulator {
   markout2mCount: number;
   markoutExpirySum: number;
   markoutExpiryCount: number;
+  cashDeltaDriftSum: number;
+  cashDeltaDriftCount: number;
+  feeDriftSum: number;
+  feeDriftCount: number;
+  matchedReconciliations: number;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -135,6 +143,11 @@ function createAccumulator(key: string, label: string): BucketAccumulator {
     markout2mCount: 0,
     markoutExpirySum: 0,
     markoutExpiryCount: 0,
+    cashDeltaDriftSum: 0,
+    cashDeltaDriftCount: 0,
+    feeDriftSum: 0,
+    feeDriftCount: 0,
+    matchedReconciliations: 0,
   };
 }
 
@@ -166,6 +179,17 @@ function applyTradeToAccumulator(accumulator: BucketAccumulator, trade: Executio
     accumulator.markoutExpirySum += trade.markoutExpiry;
     accumulator.markoutExpiryCount += 1;
   }
+  if (trade.reconciliationMatched) {
+    accumulator.matchedReconciliations += 1;
+  }
+  if (typeof trade.cashDeltaDriftUsd === "number" && Number.isFinite(trade.cashDeltaDriftUsd)) {
+    accumulator.cashDeltaDriftSum += trade.cashDeltaDriftUsd;
+    accumulator.cashDeltaDriftCount += 1;
+  }
+  if (typeof trade.feeDriftUsd === "number" && Number.isFinite(trade.feeDriftUsd)) {
+    accumulator.feeDriftSum += trade.feeDriftUsd;
+    accumulator.feeDriftCount += 1;
+  }
 }
 
 function finalizeAccumulator(accumulator: BucketAccumulator): ExecutionAttributionBucket {
@@ -182,6 +206,7 @@ function finalizeAccumulator(accumulator: BucketAccumulator): ExecutionAttributi
     avgMarkout30s: average(accumulator.markout30sSum, accumulator.markout30sCount),
     avgMarkout2m: average(accumulator.markout2mSum, accumulator.markout2mCount),
     avgMarkoutExpiry: average(accumulator.markoutExpirySum, accumulator.markoutExpiryCount),
+    avgCashDeltaDriftUsd: average(accumulator.cashDeltaDriftSum, accumulator.cashDeltaDriftCount),
   };
 }
 
@@ -220,11 +245,53 @@ function resolveOrderId(
   return undefined;
 }
 
+function parseIsoTime(value: string | undefined) {
+  if (!value) return null;
+  const ts = new Date(value).getTime();
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function resolveAnchorTs(args: {
+  decisionRecordedAt: string;
+  order?: StoredKalshiOrderEvent;
+  fills: StoredKalshiFillEvent[];
+}) {
+  const fillTimes = args.fills.map((fill) => parseIsoTime(fill.createdTime)).filter((value): value is number => value !== null);
+  if (fillTimes.length) return Math.min(...fillTimes);
+  const orderTime = parseIsoTime(args.order?.createdTime) ?? parseIsoTime(args.order?.lastUpdateTime);
+  if (orderTime !== null) return orderTime;
+  return new Date(args.decisionRecordedAt).getTime();
+}
+
+function resolveBalanceWindow(
+  balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>,
+  anchorTs: number,
+) {
+  let before: PredictionStorageEnvelope<StoredKalshiBalanceEvent> | null = null;
+  let after: PredictionStorageEnvelope<StoredKalshiBalanceEvent> | null = null;
+
+  for (const balance of balances) {
+    const ts = new Date(balance.recordedAt).getTime();
+    if (!Number.isFinite(ts)) continue;
+    if (ts <= anchorTs) {
+      if (!before || ts >= new Date(before.recordedAt).getTime()) before = balance;
+    }
+    if (ts >= anchorTs) {
+      if (!after || ts <= new Date(after.recordedAt).getTime()) after = balance;
+    }
+  }
+
+  return { before, after };
+}
+
 function summarizeOrderExecution(args: {
   decision: StoredCandidateDecisionEvent;
+  decisionRecordedAt: string;
+  order?: StoredKalshiOrderEvent;
   orderId?: string;
   fillsByOrderId: Map<string, StoredKalshiFillEvent[]>;
   markoutsByFillId: Map<string, Map<AttributionHorizon, StoredMarkoutEvent>>;
+  balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>;
 }) {
   const fills = args.orderId ? args.fillsByOrderId.get(args.orderId) ?? [] : [];
   let filledContracts = 0;
@@ -261,6 +328,46 @@ function summarizeOrderExecution(args: {
     }
   }
 
+  const anchorTs = resolveAnchorTs({
+    decisionRecordedAt: args.decisionRecordedAt,
+    order: args.order,
+    fills,
+  });
+  const balanceWindow = resolveBalanceWindow(args.balances, anchorTs);
+  const beforeCash = balanceWindow.before?.payload.cashUsd ?? null;
+  const afterCash = balanceWindow.after?.payload.cashUsd ?? null;
+  const beforePortfolio = balanceWindow.before?.payload.portfolioUsd ?? null;
+  const afterPortfolio = balanceWindow.after?.payload.portfolioUsd ?? null;
+  const actualCashDeltaUsd =
+    typeof beforeCash === "number" && typeof afterCash === "number" ? Number((beforeCash - afterCash).toFixed(4)) : null;
+  const reconciliation = reconcileKalshiExecution({
+    intent: {
+      side: args.decision.side,
+      requestedCount: args.decision.recommendedContracts,
+      snappedCount: args.decision.recommendedContracts,
+      requestedLimitPriceCents: args.decision.limitPriceCents,
+      snappedLimitPriceCents: args.decision.limitPriceCents,
+      estimatedFeeUsd: args.decision.feeEstimateUsd,
+      expectedExecutionCostUsd: Number((args.decision.recommendedStakeUsd + (args.decision.feeEstimateUsd ?? 0)).toFixed(4)),
+    },
+    fills: fills.map((fill) => ({
+      fill_id: fill.fillId,
+      order_id: fill.orderId,
+      ticker: fill.ticker,
+      side: fill.side,
+      action: fill.action,
+      count: fill.count,
+      yes_price: fill.yesPriceCents,
+      no_price: fill.noPriceCents,
+      created_time: fill.createdTime,
+    })),
+    actualCashDeltaUsd,
+  });
+  const inferredActualFeeUsd =
+    typeof actualCashDeltaUsd === "number" && typeof reconciliation.realizedNotionalUsd === "number"
+      ? Number((actualCashDeltaUsd - reconciliation.realizedNotionalUsd).toFixed(4))
+      : null;
+
   return {
     filledContracts: Number(filledContracts.toFixed(4)),
     averageFillPriceCents:
@@ -269,6 +376,20 @@ function summarizeOrderExecution(args: {
     markout2m: horizonCounts["2m"] > 0 ? Number((horizonSums["2m"] / horizonCounts["2m"]).toFixed(4)) : null,
     markoutExpiry:
       horizonCounts.expiry > 0 ? Number((horizonSums.expiry / horizonCounts.expiry).toFixed(4)) : null,
+    balanceBeforeCashUsd: beforeCash,
+    balanceAfterCashUsd: afterCash,
+    balanceBeforePortfolioUsd: beforePortfolio,
+    balanceAfterPortfolioUsd: afterPortfolio,
+    expectedExecutionCostUsd: reconciliation.expectedExecutionCostUsd,
+    actualCashDeltaUsd: reconciliation.actualCashDeltaUsd,
+    inferredActualFeeUsd,
+    estimatedFeeUsd: reconciliation.estimatedFeeUsd,
+    feeDriftUsd:
+      inferredActualFeeUsd !== null && typeof reconciliation.estimatedFeeUsd === "number"
+        ? Number((inferredActualFeeUsd - reconciliation.estimatedFeeUsd).toFixed(4))
+        : null,
+    cashDeltaDriftUsd: reconciliation.cashDeltaDriftUsd,
+    reconciliationMatched: actualCashDeltaUsd !== null,
   };
 }
 
@@ -279,6 +400,7 @@ export function summarizeExecutionAttribution({
   decisions,
   orders,
   fills,
+  balances,
   markouts,
 }: SummarizeExecutionAttributionArgs): ExecutionAttributionSummary {
   const executedDecisions = decisions
@@ -286,7 +408,9 @@ export function summarizeExecutionAttribution({
     .sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime());
 
   const ordersByClientOrderId = new Map<string, StoredKalshiOrderEvent>();
+  const ordersById = new Map<string, StoredKalshiOrderEvent>();
   for (const order of orders) {
+    ordersById.set(order.payload.orderId, order.payload);
     const clientOrderId = order.payload.clientOrderId?.trim();
     if (!clientOrderId) continue;
     const existing = ordersByClientOrderId.get(clientOrderId);
@@ -329,11 +453,15 @@ export function summarizeExecutionAttribution({
     const uncertaintyLabel = uncertaintyBucket(decision.uncertaintyWidth);
     const toxicityLabel = toxicityBucket(decision.toxicityScore);
     const orderId = resolveOrderId(decision, ordersByClientOrderId);
+    const order = orderId ? ordersById.get(orderId) : undefined;
     const executionStats = summarizeOrderExecution({
       decision,
+      decisionRecordedAt: event.recordedAt,
+      order,
       orderId,
       fillsByOrderId,
       markoutsByFillId,
+      balances,
     });
 
     const trade: ExecutionAttributionTrade = {
@@ -375,6 +503,17 @@ export function summarizeExecutionAttribution({
       markout30s: executionStats.markout30s,
       markout2m: executionStats.markout2m,
       markoutExpiry: executionStats.markoutExpiry,
+      balanceBeforeCashUsd: executionStats.balanceBeforeCashUsd,
+      balanceAfterCashUsd: executionStats.balanceAfterCashUsd,
+      balanceBeforePortfolioUsd: executionStats.balanceBeforePortfolioUsd,
+      balanceAfterPortfolioUsd: executionStats.balanceAfterPortfolioUsd,
+      expectedExecutionCostUsd: executionStats.expectedExecutionCostUsd,
+      actualCashDeltaUsd: executionStats.actualCashDeltaUsd,
+      inferredActualFeeUsd: executionStats.inferredActualFeeUsd,
+      estimatedFeeUsd: executionStats.estimatedFeeUsd,
+      feeDriftUsd: executionStats.feeDriftUsd,
+      cashDeltaDriftUsd: executionStats.cashDeltaDriftUsd,
+      reconciliationMatched: executionStats.reconciliationMatched,
     };
 
     trades.push(trade);
@@ -401,6 +540,9 @@ export function summarizeExecutionAttribution({
       avgMarkout30s: average(totals.markout30sSum, totals.markout30sCount),
       avgMarkout2m: average(totals.markout2mSum, totals.markout2mCount),
       avgMarkoutExpiry: average(totals.markoutExpirySum, totals.markoutExpiryCount),
+      matchedReconciliations: totals.matchedReconciliations,
+      avgCashDeltaDriftUsd: average(totals.cashDeltaDriftSum, totals.cashDeltaDriftCount),
+      avgFeeDriftUsd: average(totals.feeDriftSum, totals.feeDriftCount),
     },
     byExpert: finalizeBuckets(byExpert, bucketLimit),
     byExecutionHealth: finalizeBuckets(byExecutionHealth, bucketLimit),
@@ -419,10 +561,11 @@ export async function loadExecutionAttributionSummary(args?: {
 }): Promise<ExecutionAttributionSummary> {
   const lookbackHours = clamp(args?.lookbackHours ?? DEFAULT_LOOKBACK_HOURS, 1, 24 * 30);
   const sinceMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  const [decisions, orders, fills, markouts] = await Promise.all([
+  const [decisions, orders, fills, balances, markouts] = await Promise.all([
     readStoredCandidateDecisionsSince(sinceMs),
     readStoredOrdersSince(sinceMs),
     readStoredFillsSince(sinceMs),
+    readStoredBalancesSince(sinceMs),
     readStoredMarkoutsSince(sinceMs),
   ]);
 
@@ -433,6 +576,7 @@ export async function loadExecutionAttributionSummary(args?: {
     decisions,
     orders,
     fills,
+    balances,
     markouts,
   });
 }
