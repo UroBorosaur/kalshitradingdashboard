@@ -1,0 +1,34 @@
+import type {
+  AlpacaAccount,
+  AlpacaActivityFill,
+  AlpacaOrder,
+  AlpacaPortfolioHistory,
+  AlpacaPosition,
+} from "@/lib/live/alpaca";
+import type { KalshiFillLite, KalshiOrderLite, KalshiPositionLite, KalshiQuoteLite } from "@/lib/prediction/types";
+
+export interface KalshiLiveSnapshot {
+  connected: boolean;
+  provider: string;
+  balanceUsd: number | null;
+  cashUsd: number | null;
+  portfolioUsd: number | null;
+  orders: KalshiOrderLite[];
+  fills: KalshiFillLite[];
+  positions: KalshiPositionLite[];
+  quotes: Record<string, KalshiQuoteLite>;
+  error: string | null;
+}
+
+export interface LiveBrokerSnapshot {
+  connected: boolean;
+  provider: string;
+  account: AlpacaAccount | null;
+  orders: AlpacaOrder[];
+  positions: AlpacaPosition[];
+  equityHistory: AlpacaPortfolioHistory | null;
+  activities: AlpacaActivityFill[];
+  kalshi: KalshiLiveSnapshot;
+  lastSync: string | null;
+  error: string | null;
+}

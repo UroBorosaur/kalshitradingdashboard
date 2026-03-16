@@ -1,26 +1,53 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #030711;
+  --foreground: #e5ecf6;
+  --panel: #090f1d;
+  --panel-2: #0d1627;
+  --line: #1f2c40;
+  --muted: #8da2bd;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-space-grotesk);
+  --font-mono: var(--font-plex-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  border-color: var(--line);
 }
 
 body {
+  min-height: 100vh;
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-space-grotesk), sans-serif;
+  letter-spacing: 0.01em;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #23354f;
+}
+
+::-webkit-scrollbar-track {
+  background: #050b16;
+}
+
+.tech-orb-wrap {
+  width: clamp(122px, 14vw, 208px);
+  height: clamp(122px, 14vw, 208px);
+  opacity: 0.9;
+  mix-blend-mode: screen;
+  filter: drop-shadow(0 0 18px rgba(34, 211, 238, 0.22));
+  border-radius: 9999px;
+  background: radial-gradient(circle, rgba(14, 116, 144, 0.08) 0%, rgba(0, 0, 0, 0) 72%);
 }
