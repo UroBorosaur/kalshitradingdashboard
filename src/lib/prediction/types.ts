@@ -269,6 +269,16 @@ export interface ExecutionAttributionBucket {
   avgCashDeltaDriftUsd?: number | null;
 }
 
+export interface ExecutionCounterfactualBucket {
+  key: string;
+  label: string;
+  resolved: number;
+  profitable: number;
+  hitRate: number | null;
+  avgCounterfactualPnlUsd: number | null;
+  totalCounterfactualPnlUsd: number | null;
+}
+
 export interface ExecutionAttributionTrade {
   recordedAt: string;
   ticker: string;
@@ -359,6 +369,18 @@ export interface ExecutionAttributionSummary {
       avgCompositeScore: number | null;
       avgLatestQuoteDrift: number | null;
     };
+    resolvedNearMisses: {
+      count: number;
+      hitRate: number | null;
+      profitableRate: number | null;
+      avgCounterfactualPnlUsd: number | null;
+      totalCounterfactualPnlUsd: number | null;
+      avgExpiryDrift: number | null;
+      avgQuoteToExpiryDivergence: number | null;
+    };
+    falseNegativesByExpert: ExecutionCounterfactualBucket[];
+    falseNegativesByCluster: ExecutionCounterfactualBucket[];
+    falseNegativesByToxicity: ExecutionCounterfactualBucket[];
     recentNearMisses: Array<{
       recordedAt: string;
       ticker: string;
@@ -374,6 +396,12 @@ export interface ExecutionAttributionSummary {
       confidence: number;
       compositeScore: number | null;
       latestQuoteDrift: number | null;
+      settlementMark: number | null;
+      resolved: boolean;
+      realizedHit: boolean | null;
+      counterfactualPnlUsd: number | null;
+      expiryDrift: number | null;
+      quoteToExpiryDivergence: number | null;
       executionMessage?: string;
     }>;
   };

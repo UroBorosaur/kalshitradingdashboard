@@ -1,6 +1,14 @@
 import "@/lib/server-only";
 
-import { readStoredBalancesSince, readStoredCandidateDecisionsSince, readStoredFillsSince, readStoredMarkoutsSince, readStoredOrdersSince, readStoredQuotesSince } from "@/lib/storage/prediction-store";
+import {
+  readStoredBalancesSince,
+  readStoredCandidateDecisionsSince,
+  readStoredFillsSince,
+  readStoredMarkoutsSince,
+  readStoredOrdersSince,
+  readStoredQuotesSince,
+  readStoredResolutionsSince,
+} from "@/lib/storage/prediction-store";
 import type {
   PredictionStorageEnvelope,
   StoredKalshiBalanceEvent,
@@ -9,9 +17,11 @@ import type {
   StoredKalshiOrderEvent,
   StoredMarkoutEvent,
   StoredKalshiQuoteEvent,
+  StoredResolutionEvent,
 } from "@/lib/storage/types";
 import type {
   ExecutionAttributionBucket,
+  ExecutionCounterfactualBucket,
   ExecutionAttributionSummary,
   ExecutionAttributionTrade,
   ExecutionBootstrapMode,
@@ -44,6 +54,7 @@ interface SummarizeExecutionAttributionArgs {
   fills: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>>;
   balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>;
   quotes: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>;
+  resolutions: Array<PredictionStorageEnvelope<StoredResolutionEvent>>;
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
 
@@ -70,6 +81,19 @@ interface BucketAccumulator {
   feeDriftSum: number;
   feeDriftCount: number;
   matchedReconciliations: number;
+}
+
+interface CounterfactualAccumulator {
+  key: string;
+  label: string;
+  resolved: number;
+  profitable: number;
+  hitCount: number;
+  pnlSum: number;
+  expiryDriftSum: number;
+  expiryDriftCount: number;
+  divergenceSum: number;
+  divergenceCount: number;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -148,6 +172,19 @@ function quoteMarkProbability(quote: StoredKalshiQuoteEvent, side: PredictionSid
 function sourcePriority(source: string) {
   const index = NEAR_MISS_SOURCE_PRIORITY.indexOf(source as (typeof NEAR_MISS_SOURCE_PRIORITY)[number]);
   return index === -1 ? NEAR_MISS_SOURCE_PRIORITY.length : index;
+}
+
+function settlementMarkForDecision(
+  resolution: StoredResolutionEvent | undefined,
+  side: PredictionSide,
+) {
+  if (!resolution) return null;
+  if (typeof resolution.settlementPrice === "number" && Number.isFinite(resolution.settlementPrice)) {
+    return Number((side === "YES" ? resolution.settlementPrice : 1 - resolution.settlementPrice).toFixed(4));
+  }
+  if (resolution.settlementResult === "yes") return side === "YES" ? 1 : 0;
+  if (resolution.settlementResult === "no") return side === "YES" ? 0 : 1;
+  return null;
 }
 
 function createAccumulator(key: string, label: string): BucketAccumulator {
@@ -234,6 +271,84 @@ function finalizeAccumulator(accumulator: BucketAccumulator): ExecutionAttributi
     avgMarkoutExpiry: average(accumulator.markoutExpirySum, accumulator.markoutExpiryCount),
     avgCashDeltaDriftUsd: average(accumulator.cashDeltaDriftSum, accumulator.cashDeltaDriftCount),
   };
+}
+
+function createCounterfactualAccumulator(key: string, label: string): CounterfactualAccumulator {
+  return {
+    key,
+    label,
+    resolved: 0,
+    profitable: 0,
+    hitCount: 0,
+    pnlSum: 0,
+    expiryDriftSum: 0,
+    expiryDriftCount: 0,
+    divergenceSum: 0,
+    divergenceCount: 0,
+  };
+}
+
+function applyCounterfactualSample(
+  accumulator: CounterfactualAccumulator,
+  sample: {
+    settlementMark: number;
+    counterfactualPnlUsd: number;
+    latestQuoteDrift: number | null;
+    marketProb: number;
+  },
+) {
+  accumulator.resolved += 1;
+  if (sample.counterfactualPnlUsd > 0) accumulator.profitable += 1;
+  if (sample.settlementMark > 0.5) accumulator.hitCount += 1;
+  accumulator.pnlSum += sample.counterfactualPnlUsd;
+  const expiryDrift = sample.settlementMark - sample.marketProb;
+  accumulator.expiryDriftSum += expiryDrift;
+  accumulator.expiryDriftCount += 1;
+  if (typeof sample.latestQuoteDrift === "number" && Number.isFinite(sample.latestQuoteDrift)) {
+    accumulator.divergenceSum += expiryDrift - sample.latestQuoteDrift;
+    accumulator.divergenceCount += 1;
+  }
+}
+
+function finalizeCounterfactualAccumulator(accumulator: CounterfactualAccumulator): ExecutionCounterfactualBucket {
+  return {
+    key: accumulator.key,
+    label: accumulator.label,
+    resolved: accumulator.resolved,
+    profitable: accumulator.profitable,
+    hitRate: average(accumulator.hitCount, accumulator.resolved),
+    avgCounterfactualPnlUsd: average(accumulator.pnlSum, accumulator.resolved),
+    totalCounterfactualPnlUsd: accumulator.resolved > 0 ? roundNullable(accumulator.pnlSum) : null,
+  };
+}
+
+function pushCounterfactualBucket(
+  map: Map<string, CounterfactualAccumulator>,
+  key: string,
+  label: string,
+  sample: {
+    settlementMark: number;
+    counterfactualPnlUsd: number;
+    latestQuoteDrift: number | null;
+    marketProb: number;
+  },
+) {
+  const accumulator = map.get(key) ?? createCounterfactualAccumulator(key, label);
+  applyCounterfactualSample(accumulator, sample);
+  map.set(key, accumulator);
+}
+
+function finalizeCounterfactualBuckets(map: Map<string, CounterfactualAccumulator>, limit: number) {
+  return [...map.values()]
+    .map(finalizeCounterfactualAccumulator)
+    .sort((a, b) => {
+      if ((b.totalCounterfactualPnlUsd ?? 0) !== (a.totalCounterfactualPnlUsd ?? 0)) {
+        return (b.totalCounterfactualPnlUsd ?? 0) - (a.totalCounterfactualPnlUsd ?? 0);
+      }
+      if (b.resolved !== a.resolved) return b.resolved - a.resolved;
+      return a.label.localeCompare(b.label);
+    })
+    .slice(0, limit);
 }
 
 function pushBucket(
@@ -450,6 +565,7 @@ export function summarizeExecutionAttribution({
   fills,
   balances,
   quotes,
+  resolutions,
   markouts,
 }: SummarizeExecutionAttributionArgs): ExecutionAttributionSummary {
   const executedDecisions = decisions
@@ -500,6 +616,20 @@ export function summarizeExecutionAttribution({
     tickerQuotes.sort((a, b) => new Date(a.recordedAt).getTime() - new Date(b.recordedAt).getTime());
   }
 
+  const resolutionByTicker = new Map<string, PredictionStorageEnvelope<StoredResolutionEvent>>();
+  for (const resolution of resolutions) {
+    const ticker = resolution.payload.ticker?.trim().toUpperCase();
+    if (!ticker) continue;
+    const existing = resolutionByTicker.get(ticker);
+    const resolutionTs = parseIsoTime(resolution.payload.resolvedAt) ?? new Date(resolution.recordedAt).getTime();
+    const existingTs = existing
+      ? parseIsoTime(existing.payload.resolvedAt) ?? new Date(existing.recordedAt).getTime()
+      : -Infinity;
+    if (!existing || resolutionTs >= existingTs) {
+      resolutionByTicker.set(ticker, resolution);
+    }
+  }
+
   const preferredDecisionsByKey = new Map<string, PredictionStorageEnvelope<StoredCandidateDecisionEvent>>();
   for (const event of candidateDecisions) {
     const payload = event.payload;
@@ -526,6 +656,9 @@ export function summarizeExecutionAttribution({
   const byUncertainty = new Map<string, BucketAccumulator>();
   const byToxicity = new Map<string, BucketAccumulator>();
   const byBootstrap = new Map<string, BucketAccumulator>();
+  const falseNegativesByExpert = new Map<string, CounterfactualAccumulator>();
+  const falseNegativesByCluster = new Map<string, CounterfactualAccumulator>();
+  const falseNegativesByToxicity = new Map<string, CounterfactualAccumulator>();
   const totals = createAccumulator("totals", "Totals");
   const trades: ExecutionAttributionTrade[] = [];
 
@@ -670,6 +803,14 @@ export function summarizeExecutionAttribution({
     nearMissQuoteDrifts.reduce((sum, value) => sum + value, 0),
     nearMissQuoteDrifts.length,
   );
+  let resolvedNearMissCount = 0;
+  let resolvedNearMissHitCount = 0;
+  let resolvedNearMissProfitableCount = 0;
+  let resolvedNearMissPnlSum = 0;
+  let resolvedNearMissExpiryDriftSum = 0;
+  let resolvedNearMissExpiryDriftCount = 0;
+  let resolvedNearMissDivergenceSum = 0;
+  let resolvedNearMissDivergenceCount = 0;
   const seenRecentNearMisses = new Set<string>();
   const recentNearMisses = nearMisses
     .filter((event) => {
@@ -681,6 +822,55 @@ export function summarizeExecutionAttribution({
     .slice(0, clamp(recentTradeLimit, 1, 30))
     .map((event) => {
       const dominantExpert = determineDominantExpert(event.payload.expertWeights);
+      const latestQuoteDrift = latestQuoteDriftForDecision({ decision: event, quotesByTicker });
+      const resolution = resolutionByTicker.get(event.payload.ticker)?.payload;
+      const settlementMark = settlementMarkForDecision(resolution, event.payload.side);
+      const counterfactualPnlUsd =
+        settlementMark !== null
+          ? Number(
+              (
+                event.payload.recommendedContracts * (settlementMark - event.payload.limitPriceCents / 100) -
+                (event.payload.feeEstimateUsd ?? 0)
+              ).toFixed(4),
+            )
+          : null;
+      const expiryDrift =
+        settlementMark !== null ? Number((settlementMark - event.payload.marketProb).toFixed(4)) : null;
+      const quoteToExpiryDivergence =
+        settlementMark !== null && typeof latestQuoteDrift === "number"
+          ? Number((expiryDrift! - latestQuoteDrift).toFixed(4))
+          : null;
+      if (settlementMark !== null && counterfactualPnlUsd !== null) {
+        resolvedNearMissCount += 1;
+        if (settlementMark > 0.5) resolvedNearMissHitCount += 1;
+        if (counterfactualPnlUsd > 0) resolvedNearMissProfitableCount += 1;
+        resolvedNearMissPnlSum += counterfactualPnlUsd;
+        if (expiryDrift !== null) {
+          resolvedNearMissExpiryDriftSum += expiryDrift;
+          resolvedNearMissExpiryDriftCount += 1;
+        }
+        if (quoteToExpiryDivergence !== null) {
+          resolvedNearMissDivergenceSum += quoteToExpiryDivergence;
+          resolvedNearMissDivergenceCount += 1;
+        }
+        if (counterfactualPnlUsd > 0) {
+          const sample = {
+            settlementMark,
+            counterfactualPnlUsd,
+            latestQuoteDrift,
+            marketProb: event.payload.marketProb,
+          };
+          pushCounterfactualBucket(falseNegativesByExpert, dominantExpert.expert, dominantExpert.expert, sample);
+          pushCounterfactualBucket(
+            falseNegativesByCluster,
+            event.payload.riskCluster ?? `${event.payload.category}:${event.payload.ticker}`,
+            event.payload.riskCluster ?? `${event.payload.category}:${event.payload.ticker}`,
+            sample,
+          );
+          const toxicityLabel = toxicityBucket(event.payload.toxicityScore);
+          pushCounterfactualBucket(falseNegativesByToxicity, toxicityLabel, toxicityLabel, sample);
+        }
+      }
       return {
         recordedAt: event.recordedAt,
         ticker: event.payload.ticker,
@@ -695,7 +885,13 @@ export function summarizeExecutionAttribution({
         executionAdjustedEdge: roundNullable(event.payload.executionAdjustedEdge ?? event.payload.edge),
         confidence: Number(event.payload.confidence.toFixed(4)),
         compositeScore: roundNullable(event.payload.compositeScore),
-        latestQuoteDrift: latestQuoteDriftForDecision({ decision: event, quotesByTicker }),
+        latestQuoteDrift,
+        settlementMark,
+        resolved: settlementMark !== null,
+        realizedHit: settlementMark !== null ? settlementMark > 0.5 : null,
+        counterfactualPnlUsd,
+        expiryDrift,
+        quoteToExpiryDivergence,
         executionMessage: event.payload.executionMessage,
       };
     });
@@ -741,6 +937,18 @@ export function summarizeExecutionAttribution({
         avgCompositeScore: nearMissAvgCompositeScore,
         avgLatestQuoteDrift: nearMissAvgLatestQuoteDrift,
       },
+      resolvedNearMisses: {
+        count: resolvedNearMissCount,
+        hitRate: average(resolvedNearMissHitCount, resolvedNearMissCount),
+        profitableRate: average(resolvedNearMissProfitableCount, resolvedNearMissCount),
+        avgCounterfactualPnlUsd: average(resolvedNearMissPnlSum, resolvedNearMissCount),
+        totalCounterfactualPnlUsd: resolvedNearMissCount > 0 ? roundNullable(resolvedNearMissPnlSum) : null,
+        avgExpiryDrift: average(resolvedNearMissExpiryDriftSum, resolvedNearMissExpiryDriftCount),
+        avgQuoteToExpiryDivergence: average(resolvedNearMissDivergenceSum, resolvedNearMissDivergenceCount),
+      },
+      falseNegativesByExpert: finalizeCounterfactualBuckets(falseNegativesByExpert, bucketLimit),
+      falseNegativesByCluster: finalizeCounterfactualBuckets(falseNegativesByCluster, bucketLimit),
+      falseNegativesByToxicity: finalizeCounterfactualBuckets(falseNegativesByToxicity, bucketLimit),
       recentNearMisses,
     },
   };
@@ -753,12 +961,13 @@ export async function loadExecutionAttributionSummary(args?: {
 }): Promise<ExecutionAttributionSummary> {
   const lookbackHours = clamp(args?.lookbackHours ?? DEFAULT_LOOKBACK_HOURS, 1, 24 * 30);
   const sinceMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  const [decisions, orders, fills, balances, quotes, markouts] = await Promise.all([
+  const [decisions, orders, fills, balances, quotes, resolutions, markouts] = await Promise.all([
     readStoredCandidateDecisionsSince(sinceMs),
     readStoredOrdersSince(sinceMs),
     readStoredFillsSince(sinceMs),
     readStoredBalancesSince(sinceMs),
     readStoredQuotesSince(sinceMs),
+    readStoredResolutionsSince(sinceMs),
     readStoredMarkoutsSince(sinceMs),
   ]);
 
@@ -771,6 +980,7 @@ export async function loadExecutionAttributionSummary(args?: {
     fills,
     balances,
     quotes,
+    resolutions,
     markouts,
   });
 }

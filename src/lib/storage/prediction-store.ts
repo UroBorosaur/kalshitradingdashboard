@@ -513,6 +513,10 @@ export async function readStoredQuotesSince(sinceMs: number) {
   return readPredictionEventsSince<StoredKalshiQuoteEvent>("raw", "quotes", sinceMs);
 }
 
+export async function readStoredResolutionsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredResolutionEvent>("raw", "resolutions", sinceMs);
+}
+
 export async function persistMarkoutEvents(
   source: string,
   markouts: StoredMarkoutEvent[],

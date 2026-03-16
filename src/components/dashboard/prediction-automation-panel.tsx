@@ -710,6 +710,45 @@ export function PredictionAutomationPanel() {
                           </div>
                         </div>
 
+                        <div className="rounded border border-slate-800 bg-slate-900/60 p-2 text-[11px] text-slate-300">
+                          <p className="text-slate-400">Resolved Near Misses</p>
+                          <p>
+                            Count {attribution.selectionControl.resolvedNearMisses.count} | Hit{" "}
+                            {formatPercent(attribution.selectionControl.resolvedNearMisses.hitRate)} | Profitable{" "}
+                            {formatPercent(attribution.selectionControl.resolvedNearMisses.profitableRate)}
+                          </p>
+                          <p>
+                            Avg CF PnL {formatUsd(attribution.selectionControl.resolvedNearMisses.avgCounterfactualPnlUsd)} | Total CF PnL{" "}
+                            {formatUsd(attribution.selectionControl.resolvedNearMisses.totalCounterfactualPnlUsd)}
+                          </p>
+                          <p>
+                            Expiry Drift {formatPercent(attribution.selectionControl.resolvedNearMisses.avgExpiryDrift)} | Quote-Expiry Div{" "}
+                            {formatPercent(attribution.selectionControl.resolvedNearMisses.avgQuoteToExpiryDivergence)}
+                          </p>
+                        </div>
+
+                        <div className="grid gap-2 md:grid-cols-3">
+                          {[
+                            { label: "False Negatives by Expert", rows: attribution.selectionControl.falseNegativesByExpert },
+                            { label: "False Negatives by Cluster", rows: attribution.selectionControl.falseNegativesByCluster },
+                            { label: "False Negatives by Toxicity", rows: attribution.selectionControl.falseNegativesByToxicity },
+                          ].map((group) => (
+                            <div key={group.label} className="rounded border border-slate-800 bg-slate-900/60 p-2">
+                              <p className="text-[11px] text-slate-400">{group.label}</p>
+                              {group.rows.length ? (
+                                group.rows.map((row) => (
+                                  <p key={`${group.label}-${row.key}`} className="mt-1 text-[11px] text-slate-300">
+                                    {row.label} | {row.profitable}/{row.resolved} profitable | hit {formatPercent(row.hitRate)} | avg{" "}
+                                    {formatUsd(row.avgCounterfactualPnlUsd)} | total {formatUsd(row.totalCounterfactualPnlUsd)}
+                                  </p>
+                                ))
+                              ) : (
+                                <p className="mt-1 text-[11px] text-slate-500">No resolved profitable near misses yet.</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">Recent Near Misses</p>
                           {attribution.selectionControl.recentNearMisses.length ? (
@@ -721,8 +760,9 @@ export function PredictionAutomationPanel() {
                                 {miss.ticker} {miss.side} | {miss.source.replace("automation/", "")} | {miss.dominantExpert} |{" "}
                                 {miss.cluster} | verdict {miss.verdict ?? "n/a"} | edge {formatPercent(miss.edge)} | exec{" "}
                                 {formatPercent(miss.executionAdjustedEdge)} | conf {formatPercent(miss.confidence)} | score{" "}
-                                {formatNumber(miss.compositeScore)} | drift {formatPercent(miss.latestQuoteDrift)} |{" "}
-                                {miss.executionMessage ?? "No message"}
+                                {formatNumber(miss.compositeScore)} | drift {formatPercent(miss.latestQuoteDrift)} | resolved{" "}
+                                {miss.resolved ? (miss.realizedHit ? "HIT" : "MISS") : "pending"} | cf {formatUsd(miss.counterfactualPnlUsd)} | div{" "}
+                                {formatPercent(miss.quoteToExpiryDivergence)} | {miss.executionMessage ?? "No message"}
                               </p>
                             ))
                           ) : (

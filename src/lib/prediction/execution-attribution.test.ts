@@ -10,6 +10,7 @@ import type {
   StoredKalshiOrderEvent,
   StoredKalshiQuoteEvent,
   StoredMarkoutEvent,
+  StoredResolutionEvent,
 } from "@/lib/storage/types";
 
 function envelope<TPayload>(
@@ -299,6 +300,23 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     ),
   ];
 
+  const resolutions = [
+    envelope<StoredResolutionEvent>(
+      "resolutions",
+      "kalshi/summary",
+      "resolution:MISS",
+      {
+        ticker: "MISS",
+        title: "Near Miss Market",
+        status: "settled",
+        settlementResult: "yes",
+        settlementPrice: 1,
+        resolvedAt: "2026-03-16T18:00:00.000Z",
+      },
+      "2026-03-16T18:00:00.000Z",
+    ),
+  ];
+
   const summary = summarizeExecutionAttribution({
     lookbackHours: 72,
     decisions,
@@ -306,6 +324,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     fills,
     balances,
     quotes,
+    resolutions,
     markouts,
     recentTradeLimit: 10,
     bucketLimit: 10,
@@ -345,4 +364,12 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.selectionControl?.nearMisses.count, 2);
   assert.equal(summary.selectionControl?.recentNearMisses[0]?.ticker, "MISS");
   assert.equal(summary.selectionControl?.recentNearMisses[0]?.latestQuoteDrift, 0.05);
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.resolved, true);
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.realizedHit, true);
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.counterfactualPnlUsd, 2.9);
+  assert.equal(summary.selectionControl?.resolvedNearMisses.count, 1);
+  assert.equal(summary.selectionControl?.resolvedNearMisses.hitRate, 1);
+  assert.equal(summary.selectionControl?.resolvedNearMisses.profitableRate, 1);
+  assert.equal(summary.selectionControl?.resolvedNearMisses.totalCounterfactualPnlUsd, 2.9);
+  assert.equal(summary.selectionControl?.falseNegativesByExpert[0]?.key, "MICROSTRUCTURE");
 });
