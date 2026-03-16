@@ -343,6 +343,40 @@ export interface ExecutionAttributionSummary {
   byToxicity: ExecutionAttributionBucket[];
   byBootstrap: ExecutionAttributionBucket[];
   recentTrades: ExecutionAttributionTrade[];
+  selectionControl?: {
+    executed: {
+      count: number;
+      avgEdge: number | null;
+      avgExecutionAdjustedEdge: number | null;
+      avgConfidence: number | null;
+      avgCompositeScore: number | null;
+    };
+    nearMisses: {
+      count: number;
+      avgEdge: number | null;
+      avgExecutionAdjustedEdge: number | null;
+      avgConfidence: number | null;
+      avgCompositeScore: number | null;
+      avgLatestQuoteDrift: number | null;
+    };
+    recentNearMisses: Array<{
+      recordedAt: string;
+      ticker: string;
+      title: string;
+      category: PredictionCategory;
+      side: PredictionSide;
+      source: string;
+      verdict?: CandidateVerdict;
+      dominantExpert: string;
+      cluster: string;
+      edge: number;
+      executionAdjustedEdge: number | null;
+      confidence: number;
+      compositeScore: number | null;
+      latestQuoteDrift: number | null;
+      executionMessage?: string;
+    }>;
+  };
 }
 
 export interface AutomationControls {

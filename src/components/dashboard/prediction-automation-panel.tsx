@@ -677,6 +677,63 @@ export function PredictionAutomationPanel() {
                       <p className="mt-1 text-[11px] text-slate-500">No executed-candidate attribution has been stored yet.</p>
                     )}
                   </div>
+
+                  <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                    <p className="text-[11px] text-slate-400">Selection Control</p>
+                    {attribution.selectionControl ? (
+                      <div className="space-y-2">
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <div className="rounded border border-slate-800 bg-slate-900/60 p-2 text-[11px] text-slate-300">
+                            <p className="text-slate-400">Executed</p>
+                            <p>
+                              Count {attribution.selectionControl.executed.count} | Edge{" "}
+                              {formatPercent(attribution.selectionControl.executed.avgEdge)} | Exec{" "}
+                              {formatPercent(attribution.selectionControl.executed.avgExecutionAdjustedEdge)}
+                            </p>
+                            <p>
+                              Confidence {formatPercent(attribution.selectionControl.executed.avgConfidence)} | Score{" "}
+                              {formatNumber(attribution.selectionControl.executed.avgCompositeScore)}
+                            </p>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-900/60 p-2 text-[11px] text-slate-300">
+                            <p className="text-slate-400">Near Misses</p>
+                            <p>
+                              Count {attribution.selectionControl.nearMisses.count} | Edge{" "}
+                              {formatPercent(attribution.selectionControl.nearMisses.avgEdge)} | Exec{" "}
+                              {formatPercent(attribution.selectionControl.nearMisses.avgExecutionAdjustedEdge)}
+                            </p>
+                            <p>
+                              Confidence {formatPercent(attribution.selectionControl.nearMisses.avgConfidence)} | Score{" "}
+                              {formatNumber(attribution.selectionControl.nearMisses.avgCompositeScore)} | Drift{" "}
+                              {formatPercent(attribution.selectionControl.nearMisses.avgLatestQuoteDrift)}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
+                          <p className="text-[11px] text-slate-400">Recent Near Misses</p>
+                          {attribution.selectionControl.recentNearMisses.length ? (
+                            attribution.selectionControl.recentNearMisses.map((miss) => (
+                              <p
+                                key={`${miss.recordedAt}-${miss.ticker}-${miss.side}-${miss.source}`}
+                                className="mt-1 text-[11px] text-slate-300"
+                              >
+                                {miss.ticker} {miss.side} | {miss.source.replace("automation/", "")} | {miss.dominantExpert} |{" "}
+                                {miss.cluster} | verdict {miss.verdict ?? "n/a"} | edge {formatPercent(miss.edge)} | exec{" "}
+                                {formatPercent(miss.executionAdjustedEdge)} | conf {formatPercent(miss.confidence)} | score{" "}
+                                {formatNumber(miss.compositeScore)} | drift {formatPercent(miss.latestQuoteDrift)} |{" "}
+                                {miss.executionMessage ?? "No message"}
+                              </p>
+                            ))
+                          ) : (
+                            <p className="mt-1 text-[11px] text-slate-500">No strong skipped candidates in the current lookback window.</p>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="mt-1 text-[11px] text-slate-500">Selection-control comparison is not available yet.</p>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div className="rounded-md border border-slate-800 bg-slate-950/60 p-3 text-slate-400">

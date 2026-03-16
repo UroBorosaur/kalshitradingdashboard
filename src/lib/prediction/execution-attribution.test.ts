@@ -8,6 +8,7 @@ import type {
   StoredKalshiBalanceEvent,
   StoredKalshiFillEvent,
   StoredKalshiOrderEvent,
+  StoredKalshiQuoteEvent,
   StoredMarkoutEvent,
 } from "@/lib/storage/types";
 
@@ -131,6 +132,38 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
       },
       "2026-03-16T11:30:00.000Z",
     ),
+    envelope<StoredCandidateDecisionEvent>(
+      "candidate_decisions",
+      "automation/planned-candidates",
+      "decision:run-3:MISS:YES",
+      {
+        runId: "run-3",
+        mode: "AI",
+        executeRequested: true,
+        ticker: "MISS",
+        title: "Near Miss Market",
+        category: "CRYPTO",
+        side: "YES",
+        verdict: "WATCHLIST",
+        marketProb: 0.41,
+        modelProb: 0.49,
+        edge: 0.04,
+        executionAdjustedEdge: 0.028,
+        confidence: 0.58,
+        recommendedStakeUsd: 3.1,
+        recommendedContracts: 5,
+        limitPriceCents: 42,
+        probabilityTransform: "SIGMOID",
+        calibrationMethod: "TEMPERATURE",
+        expertWeights: [{ expert: "MICROSTRUCTURE", weight: 0.55, probability: 0.5 }],
+        compositeScore: 0.009,
+        riskCluster: "CRYPTO:MISS",
+        executionStatus: "SKIPPED",
+        executionMessage: "Skipped after portfolio sizing.",
+        rationale: [],
+      },
+      "2026-03-16T11:45:00.000Z",
+    ),
   ];
 
   const orders = [
@@ -247,12 +280,32 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     ),
   ];
 
+  const quotes = [
+    envelope<StoredKalshiQuoteEvent>(
+      "quotes",
+      "kalshi/summary",
+      "quote:MISS",
+      {
+        ticker: "MISS",
+        title: "Near Miss Market",
+        marketStatus: "open",
+        yesBid: 0.46,
+        yesAsk: 0.47,
+        noBid: 0.53,
+        noAsk: 0.54,
+        lastPrice: 0.46,
+      },
+      "2026-03-16T12:10:00.000Z",
+    ),
+  ];
+
   const summary = summarizeExecutionAttribution({
     lookbackHours: 72,
     decisions,
     orders,
     fills,
     balances,
+    quotes,
     markouts,
     recentTradeLimit: 10,
     bucketLimit: 10,
@@ -287,4 +340,9 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(firstTrade.actualCashDeltaUsd, 1.24);
   assert.equal(firstTrade.cashDeltaDriftUsd, 0);
   assert.equal(firstTrade.inferredActualFeeUsd, 0.02);
+
+  assert.equal(summary.selectionControl?.executed.count, 1);
+  assert.equal(summary.selectionControl?.nearMisses.count, 2);
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.ticker, "MISS");
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.latestQuoteDrift, 0.05);
 });

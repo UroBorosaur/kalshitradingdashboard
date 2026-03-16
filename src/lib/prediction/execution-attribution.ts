@@ -1,6 +1,6 @@
 import "@/lib/server-only";
 
-import { readStoredBalancesSince, readStoredCandidateDecisionsSince, readStoredFillsSince, readStoredMarkoutsSince, readStoredOrdersSince } from "@/lib/storage/prediction-store";
+import { readStoredBalancesSince, readStoredCandidateDecisionsSince, readStoredFillsSince, readStoredMarkoutsSince, readStoredOrdersSince, readStoredQuotesSince } from "@/lib/storage/prediction-store";
 import type {
   PredictionStorageEnvelope,
   StoredKalshiBalanceEvent,
@@ -8,6 +8,7 @@ import type {
   StoredKalshiFillEvent,
   StoredKalshiOrderEvent,
   StoredMarkoutEvent,
+  StoredKalshiQuoteEvent,
 } from "@/lib/storage/types";
 import type {
   ExecutionAttributionBucket,
@@ -23,6 +24,14 @@ const EXECUTED_CANDIDATE_SOURCE = "automation/executed-candidates";
 const DEFAULT_LOOKBACK_HOURS = 72;
 const DEFAULT_RECENT_TRADE_LIMIT = 12;
 const DEFAULT_BUCKET_LIMIT = 6;
+const NEAR_MISS_SOURCE_PRIORITY = [
+  "automation/executed-candidates",
+  "automation/planned-candidates",
+  "automation/exploratory-boost",
+  "automation/throughput-recovery-step-1",
+  "automation/throughput-recovery-step-2",
+  "automation/generated-candidates",
+] as const;
 
 type AttributionHorizon = "30s" | "2m" | "expiry";
 
@@ -34,6 +43,7 @@ interface SummarizeExecutionAttributionArgs {
   orders: Array<PredictionStorageEnvelope<StoredKalshiOrderEvent>>;
   fills: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>>;
   balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>;
+  quotes: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>;
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
 
@@ -122,6 +132,22 @@ function fillPriceCentsForSide(fill: StoredKalshiFillEvent, side: PredictionSide
     if (yesPrice !== null) return 100 - yesPrice;
   }
   return null;
+}
+
+function quoteMarkProbability(quote: StoredKalshiQuoteEvent, side: PredictionSide) {
+  const yesMark =
+    typeof quote.yesBid === "number" && Number.isFinite(quote.yesBid)
+      ? quote.yesBid
+      : typeof quote.lastPrice === "number" && Number.isFinite(quote.lastPrice)
+        ? quote.lastPrice
+        : null;
+  if (yesMark === null) return null;
+  return side === "YES" ? yesMark : Number((1 - yesMark).toFixed(4));
+}
+
+function sourcePriority(source: string) {
+  const index = NEAR_MISS_SOURCE_PRIORITY.indexOf(source as (typeof NEAR_MISS_SOURCE_PRIORITY)[number]);
+  return index === -1 ? NEAR_MISS_SOURCE_PRIORITY.length : index;
 }
 
 function createAccumulator(key: string, label: string): BucketAccumulator {
@@ -284,6 +310,28 @@ function resolveBalanceWindow(
   return { before, after };
 }
 
+function latestQuoteDriftForDecision(args: {
+  decision: PredictionStorageEnvelope<StoredCandidateDecisionEvent>;
+  quotesByTicker: Map<string, Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>>;
+}) {
+  const quotes = args.quotesByTicker.get(args.decision.payload.ticker) ?? [];
+  const decisionTs = new Date(args.decision.recordedAt).getTime();
+  let latest: PredictionStorageEnvelope<StoredKalshiQuoteEvent> | null = null;
+
+  for (const quote of quotes) {
+    const ts = new Date(quote.recordedAt).getTime();
+    if (!Number.isFinite(ts) || ts < decisionTs) continue;
+    if (!latest || ts > new Date(latest.recordedAt).getTime()) {
+      latest = quote;
+    }
+  }
+
+  if (!latest) return null;
+  const mark = quoteMarkProbability(latest.payload, args.decision.payload.side);
+  if (mark === null) return null;
+  return Number((mark - args.decision.payload.marketProb).toFixed(4));
+}
+
 function summarizeOrderExecution(args: {
   decision: StoredCandidateDecisionEvent;
   decisionRecordedAt: string;
@@ -401,10 +449,14 @@ export function summarizeExecutionAttribution({
   orders,
   fills,
   balances,
+  quotes,
   markouts,
 }: SummarizeExecutionAttributionArgs): ExecutionAttributionSummary {
   const executedDecisions = decisions
     .filter((event) => event.source === EXECUTED_CANDIDATE_SOURCE)
+    .sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime());
+  const candidateDecisions = decisions
+    .filter((event) => NEAR_MISS_SOURCE_PRIORITY.includes(event.source as (typeof NEAR_MISS_SOURCE_PRIORITY)[number]))
     .sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime());
 
   const ordersByClientOrderId = new Map<string, StoredKalshiOrderEvent>();
@@ -434,6 +486,38 @@ export function summarizeExecutionAttribution({
     const next = markoutsByFillId.get(markout.payload.fillId) ?? new Map<AttributionHorizon, StoredMarkoutEvent>();
     next.set(markout.payload.horizon, markout.payload);
     markoutsByFillId.set(markout.payload.fillId, next);
+  }
+
+  const quotesByTicker = new Map<string, Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>>();
+  for (const quote of quotes) {
+    const ticker = quote.payload.ticker?.trim().toUpperCase();
+    if (!ticker) continue;
+    const next = quotesByTicker.get(ticker) ?? [];
+    next.push(quote);
+    quotesByTicker.set(ticker, next);
+  }
+  for (const tickerQuotes of quotesByTicker.values()) {
+    tickerQuotes.sort((a, b) => new Date(a.recordedAt).getTime() - new Date(b.recordedAt).getTime());
+  }
+
+  const preferredDecisionsByKey = new Map<string, PredictionStorageEnvelope<StoredCandidateDecisionEvent>>();
+  for (const event of candidateDecisions) {
+    const payload = event.payload;
+    const key = `${payload.runId}:${payload.ticker}:${payload.side}`;
+    const existing = preferredDecisionsByKey.get(key);
+    if (!existing) {
+      preferredDecisionsByKey.set(key, event);
+      continue;
+    }
+    const eventPriority = sourcePriority(event.source);
+    const existingPriority = sourcePriority(existing.source);
+    if (eventPriority < existingPriority) {
+      preferredDecisionsByKey.set(key, event);
+      continue;
+    }
+    if (eventPriority === existingPriority && new Date(event.recordedAt).getTime() > new Date(existing.recordedAt).getTime()) {
+      preferredDecisionsByKey.set(key, event);
+    }
   }
 
   const byExpert = new Map<string, BucketAccumulator>();
@@ -526,6 +610,96 @@ export function summarizeExecutionAttribution({
     pushBucket(byBootstrap, bootstrapMode, bootstrapMode, trade);
   }
 
+  const placedExecutedKeys = new Set(
+    executedDecisions
+      .filter((event) => event.payload.executionStatus === "PLACED")
+      .map((event) => `${event.payload.runId}:${event.payload.ticker}:${event.payload.side}`),
+  );
+  const placedExecutedDecisions = executedDecisions.filter((event) => event.payload.executionStatus === "PLACED");
+  const nearMisses = [...preferredDecisionsByKey.values()]
+    .filter((event) => !placedExecutedKeys.has(`${event.payload.runId}:${event.payload.ticker}:${event.payload.side}`))
+    .filter((event) => {
+      const adjustedEdge = event.payload.executionAdjustedEdge ?? event.payload.edge;
+      return adjustedEdge > 0 && event.payload.confidence >= 0.35 && event.payload.verdict !== "PASS";
+    })
+    .sort((a, b) => {
+      const aScore = (a.payload.executionAdjustedEdge ?? a.payload.edge) + (a.payload.compositeScore ?? 0);
+      const bScore = (b.payload.executionAdjustedEdge ?? b.payload.edge) + (b.payload.compositeScore ?? 0);
+      return bScore - aScore;
+    });
+
+  const executedAvgEdge = average(
+    placedExecutedDecisions.reduce((sum, event) => sum + event.payload.edge, 0),
+    placedExecutedDecisions.length,
+  );
+  const executedAvgExecutionAdjustedEdge = average(
+    placedExecutedDecisions.reduce((sum, event) => sum + (event.payload.executionAdjustedEdge ?? event.payload.edge), 0),
+    placedExecutedDecisions.length,
+  );
+  const executedAvgConfidence = average(
+    placedExecutedDecisions.reduce((sum, event) => sum + event.payload.confidence, 0),
+    placedExecutedDecisions.length,
+  );
+  const executedCompositeSamples = placedExecutedDecisions.filter((event) => typeof event.payload.compositeScore === "number");
+  const executedAvgCompositeScore = average(
+    executedCompositeSamples.reduce((sum, event) => sum + (event.payload.compositeScore ?? 0), 0),
+    executedCompositeSamples.length,
+  );
+
+  const nearMissQuoteDrifts = nearMisses
+    .map((event) => latestQuoteDriftForDecision({ decision: event, quotesByTicker }))
+    .filter((value): value is number => value !== null);
+  const nearMissAvgEdge = average(
+    nearMisses.reduce((sum, event) => sum + event.payload.edge, 0),
+    nearMisses.length,
+  );
+  const nearMissAvgExecutionAdjustedEdge = average(
+    nearMisses.reduce((sum, event) => sum + (event.payload.executionAdjustedEdge ?? event.payload.edge), 0),
+    nearMisses.length,
+  );
+  const nearMissAvgConfidence = average(
+    nearMisses.reduce((sum, event) => sum + event.payload.confidence, 0),
+    nearMisses.length,
+  );
+  const nearMissCompositeSamples = nearMisses.filter((event) => typeof event.payload.compositeScore === "number");
+  const nearMissAvgCompositeScore = average(
+    nearMissCompositeSamples.reduce((sum, event) => sum + (event.payload.compositeScore ?? 0), 0),
+    nearMissCompositeSamples.length,
+  );
+  const nearMissAvgLatestQuoteDrift = average(
+    nearMissQuoteDrifts.reduce((sum, value) => sum + value, 0),
+    nearMissQuoteDrifts.length,
+  );
+  const seenRecentNearMisses = new Set<string>();
+  const recentNearMisses = nearMisses
+    .filter((event) => {
+      const key = `${event.payload.ticker}:${event.payload.side}`;
+      if (seenRecentNearMisses.has(key)) return false;
+      seenRecentNearMisses.add(key);
+      return true;
+    })
+    .slice(0, clamp(recentTradeLimit, 1, 30))
+    .map((event) => {
+      const dominantExpert = determineDominantExpert(event.payload.expertWeights);
+      return {
+        recordedAt: event.recordedAt,
+        ticker: event.payload.ticker,
+        title: event.payload.title,
+        category: event.payload.category,
+        side: event.payload.side,
+        source: event.source,
+        verdict: event.payload.verdict,
+        dominantExpert: dominantExpert.expert,
+        cluster: event.payload.riskCluster ?? `${event.payload.category}:${event.payload.ticker}`,
+        edge: Number(event.payload.edge.toFixed(4)),
+        executionAdjustedEdge: roundNullable(event.payload.executionAdjustedEdge ?? event.payload.edge),
+        confidence: Number(event.payload.confidence.toFixed(4)),
+        compositeScore: roundNullable(event.payload.compositeScore),
+        latestQuoteDrift: latestQuoteDriftForDecision({ decision: event, quotesByTicker }),
+        executionMessage: event.payload.executionMessage,
+      };
+    });
+
   return {
     generatedAt: new Date().toISOString(),
     lookbackHours,
@@ -551,6 +725,24 @@ export function summarizeExecutionAttribution({
     byToxicity: finalizeBuckets(byToxicity, bucketLimit),
     byBootstrap: finalizeBuckets(byBootstrap, bucketLimit),
     recentTrades: trades.slice(0, clamp(recentTradeLimit, 1, 30)),
+    selectionControl: {
+      executed: {
+        count: placedExecutedDecisions.length,
+        avgEdge: executedAvgEdge,
+        avgExecutionAdjustedEdge: executedAvgExecutionAdjustedEdge,
+        avgConfidence: executedAvgConfidence,
+        avgCompositeScore: executedAvgCompositeScore,
+      },
+      nearMisses: {
+        count: nearMisses.length,
+        avgEdge: nearMissAvgEdge,
+        avgExecutionAdjustedEdge: nearMissAvgExecutionAdjustedEdge,
+        avgConfidence: nearMissAvgConfidence,
+        avgCompositeScore: nearMissAvgCompositeScore,
+        avgLatestQuoteDrift: nearMissAvgLatestQuoteDrift,
+      },
+      recentNearMisses,
+    },
   };
 }
 
@@ -561,11 +753,12 @@ export async function loadExecutionAttributionSummary(args?: {
 }): Promise<ExecutionAttributionSummary> {
   const lookbackHours = clamp(args?.lookbackHours ?? DEFAULT_LOOKBACK_HOURS, 1, 24 * 30);
   const sinceMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  const [decisions, orders, fills, balances, markouts] = await Promise.all([
+  const [decisions, orders, fills, balances, quotes, markouts] = await Promise.all([
     readStoredCandidateDecisionsSince(sinceMs),
     readStoredOrdersSince(sinceMs),
     readStoredFillsSince(sinceMs),
     readStoredBalancesSince(sinceMs),
+    readStoredQuotesSince(sinceMs),
     readStoredMarkoutsSince(sinceMs),
   ]);
 
@@ -577,6 +770,7 @@ export async function loadExecutionAttributionSummary(args?: {
     orders,
     fills,
     balances,
+    quotes,
     markouts,
   });
 }

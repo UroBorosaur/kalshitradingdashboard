@@ -509,6 +509,10 @@ export async function readStoredBalancesSince(sinceMs: number) {
   return readPredictionEventsSince<StoredKalshiBalanceEvent>("raw", "balances", sinceMs);
 }
 
+export async function readStoredQuotesSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredKalshiQuoteEvent>("raw", "quotes", sinceMs);
+}
+
 export async function persistMarkoutEvents(
   source: string,
   markouts: StoredMarkoutEvent[],
