@@ -22,6 +22,7 @@ const initialSnapshot: LiveBrokerSnapshot = {
     fills: [],
     positions: [],
     quotes: {},
+    stream: null,
     error: null,
   },
   lastSync: null,
@@ -75,6 +76,7 @@ export function useLiveBrokerData(enabled: boolean) {
           fills: LiveBrokerSnapshot["kalshi"]["fills"];
           positions?: LiveBrokerSnapshot["kalshi"]["positions"];
           quotes?: LiveBrokerSnapshot["kalshi"]["quotes"];
+          stream?: LiveBrokerSnapshot["kalshi"]["stream"];
           error?: string | null;
         }>("/api/live/kalshi/summary"),
       ]);
@@ -97,6 +99,7 @@ export function useLiveBrokerData(enabled: boolean) {
           fills: kalshiRes.fills ?? [],
           positions: kalshiRes.positions ?? [],
           quotes: kalshiRes.quotes ?? {},
+          stream: kalshiRes.stream ?? null,
           error: kalshiRes.error ?? null,
         },
         lastSync: new Date().toISOString(),

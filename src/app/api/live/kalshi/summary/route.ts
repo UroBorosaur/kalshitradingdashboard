@@ -2,12 +2,9 @@ import { NextResponse } from "next/server";
 
 import {
   getKalshiDemoBalancesUsd,
-  getKalshiDemoFills,
-  getKalshiDemoPositions,
-  getKalshiMarketQuotes,
-  getKalshiDemoOrders,
   kalshiConnectionStatus,
 } from "@/lib/prediction/kalshi";
+import { getKalshiLiveSummaryStream } from "@/lib/prediction/kalshi-stream";
 import { persistKalshiSummarySnapshot } from "@/lib/storage/prediction-store";
 
 export async function GET() {
@@ -25,22 +22,15 @@ export async function GET() {
       fills: [],
       positions: [],
       quotes: {},
+      stream: null,
       error: status.reason ?? "Kalshi credentials not configured.",
     });
   }
 
   try {
-    const [orders, fills, positions, balances] = await Promise.all([
-      getKalshiDemoOrders(500),
-      getKalshiDemoFills(500),
-      getKalshiDemoPositions(200),
-      getKalshiDemoBalancesUsd(),
-    ]);
-    const quoteTickers = [
-      ...positions.map((position) => position.ticker),
-      ...orders.map((order) => order.ticker),
-    ];
-    const quotes = await getKalshiMarketQuotes(quoteTickers);
+    const balances = await getKalshiDemoBalancesUsd();
+    const seededSummary = await getKalshiLiveSummaryStream([]);
+    const { orders, fills, positions, quotes, stream } = seededSummary;
     await persistKalshiSummarySnapshot({
       orders,
       fills,
@@ -60,12 +50,13 @@ export async function GET() {
       fills,
       positions,
       quotes,
+      stream,
       error: null,
     });
   } catch (error) {
     return NextResponse.json({
       ok: true,
-      connected: false,
+      connected: status.connected,
       provider: status.provider,
       balanceUsd: null,
       cashUsd: null,
@@ -74,6 +65,7 @@ export async function GET() {
       fills: [],
       positions: [],
       quotes: {},
+      stream: null,
       error: (error as Error).message,
     });
   }

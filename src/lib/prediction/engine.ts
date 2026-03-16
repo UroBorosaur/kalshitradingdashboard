@@ -5,13 +5,10 @@ import { randomUUID } from "node:crypto";
 import { getOptionChainSnapshots, getStockSnapshots } from "@/lib/live/alpaca";
 import {
   getKalshiDemoBalanceUsd,
-  getKalshiDemoFills,
-  getKalshiDemoOrders,
-  getKalshiDemoPositions,
-  getKalshiOpenMarkets,
   kalshiConnectionStatus,
   placeKalshiDemoOrder,
 } from "@/lib/prediction/kalshi";
+import { getKalshiOpenMarketsStream, getKalshiPrivateStateStream } from "@/lib/prediction/kalshi-stream";
 import { refreshMarkoutTelemetry } from "@/lib/prediction/markouts";
 import { persistCandidateDecisions, persistMarketScan } from "@/lib/storage/prediction-store";
 import {
@@ -3998,14 +3995,20 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const scanCategories = [...ALL_SCAN_CATEGORIES];
   const marketScanLimit = 1200;
 
-  const [markets, account, btcSpot, existingPositions, existingOrders, recentFills] = await Promise.all([
-    getKalshiOpenMarkets(scanCategories, marketScanLimit),
+  const [markets, account, btcSpot, livePrivateState] = await Promise.all([
+    getKalshiOpenMarketsStream(scanCategories, marketScanLimit),
     resolveAccountBalance(),
     getBitcoinSpotUsd(),
-    getKalshiDemoPositions(500).catch(() => []),
-    getKalshiDemoOrders(500).catch(() => []),
-    getKalshiDemoFills(500).catch(() => []),
+    getKalshiPrivateStateStream().catch(() => ({
+      orders: [],
+      fills: [],
+      positions: [],
+      quotes: {},
+    })),
   ]);
+  const existingPositions = livePrivateState.positions;
+  const existingOrders = livePrivateState.orders;
+  const recentFills = livePrivateState.fills;
   const accountBalanceUsd = account.balanceUsd;
   const openPositionConstraint = buildOpenPositionConstraint(existingPositions, existingOrders);
 

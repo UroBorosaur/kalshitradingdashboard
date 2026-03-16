@@ -7,6 +7,23 @@ import type {
 } from "@/lib/live/alpaca";
 import type { KalshiFillLite, KalshiOrderLite, KalshiPositionLite, KalshiQuoteLite } from "@/lib/prediction/types";
 
+export interface KalshiStreamStatus {
+  connected: boolean;
+  primedPublic: boolean;
+  primedPrivate: boolean;
+  lastMessageAt: string | null;
+  lastHeartbeatAt: string | null;
+  lastResyncAt: string | null;
+  reconnectCount: number;
+  desyncCount: number;
+  reason: string | null;
+  subscriptions: Array<{
+    channel: string;
+    sid: number | null;
+    marketCount: number;
+  }>;
+}
+
 export interface KalshiLiveSnapshot {
   connected: boolean;
   provider: string;
@@ -17,6 +34,7 @@ export interface KalshiLiveSnapshot {
   fills: KalshiFillLite[];
   positions: KalshiPositionLite[];
   quotes: Record<string, KalshiQuoteLite>;
+  stream: KalshiStreamStatus | null;
   error: string | null;
 }
 

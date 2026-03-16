@@ -15,6 +15,7 @@ import type {
 
 const DEFAULT_KALSHI_TRADING_BASE = "https://demo-api.kalshi.co/trade-api/v2";
 const DEFAULT_KALSHI_MARKET_DATA_BASE = "https://demo-api.kalshi.co/trade-api/v2";
+const DEFAULT_KALSHI_WS_BASE = "wss://demo-api.kalshi.co/trade-api/ws/v2";
 
 function normalizeBase(raw: string | undefined, fallback: string): string {
   const base = (raw ?? fallback).trim();
@@ -27,6 +28,7 @@ const KALSHI_MARKET_DATA_BASE_URL = normalizeBase(
   process.env.KALSHI_MARKET_DATA_BASE_URL,
   DEFAULT_KALSHI_MARKET_DATA_BASE,
 );
+const KALSHI_WS_BASE_URL = normalizeBase(process.env.KALSHI_WS_BASE_URL, DEFAULT_KALSHI_WS_BASE);
 const KALSHI_KEY_ID = process.env.KALSHI_KEY_ID ?? "";
 const KALSHI_PRIVATE_KEY_PATH = process.env.KALSHI_PRIVATE_KEY_PATH ?? "";
 
@@ -279,6 +281,18 @@ function signedHeaders(method: string, pathWithoutQuery: string): Record<string,
     "KALSHI-ACCESS-TIMESTAMP": timestamp,
     "KALSHI-ACCESS-SIGNATURE": signature,
   };
+}
+
+export function getKalshiSignedHeaders(method: string, pathWithoutQuery: string): Record<string, string> {
+  return signedHeaders(method, pathWithoutQuery);
+}
+
+export function getKalshiWebSocketBaseUrl() {
+  return KALSHI_WS_BASE_URL;
+}
+
+export function kalshiHasTradingCredentials() {
+  return hasTradingCredentials();
 }
 
 async function kalshiRequest<T>(path: string, init?: RequestInit, authenticated = false): Promise<T> {
