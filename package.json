@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test src/lib/prediction/**/*.test.ts"
+    "test": "tsx --test src/lib/prediction/**/*.test.ts",
+    "verify:order-groups": "tsx scripts/verify-kalshi-order-groups.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

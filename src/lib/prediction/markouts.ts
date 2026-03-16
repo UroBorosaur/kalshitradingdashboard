@@ -1,4 +1,4 @@
-import "server-only";
+import "@/lib/server-only";
 
 import { persistMarkoutEvents, readStoredMarkoutsSince } from "@/lib/storage/prediction-store";
 import type { MarkoutHorizonKey, StoredMarkoutEvent } from "@/lib/storage/types";

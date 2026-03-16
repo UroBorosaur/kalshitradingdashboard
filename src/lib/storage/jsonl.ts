@@ -1,4 +1,4 @@
-import "server-only";
+import "@/lib/server-only";
 
 import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";

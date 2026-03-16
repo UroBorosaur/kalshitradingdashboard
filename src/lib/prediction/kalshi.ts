@@ -1,4 +1,4 @@
-import "server-only";
+import "@/lib/server-only";
 
 import crypto from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -513,10 +513,8 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
     const priceDollars = formatKalshiPriceDollars(priceCents / 100);
     if (side === "yes") {
       body.yes_price_dollars = priceDollars;
-      if (Math.abs(priceCents - Math.round(priceCents)) < 1e-9) body.yes_price = Math.round(priceCents);
     } else {
       body.no_price_dollars = priceDollars;
-      if (Math.abs(priceCents - Math.round(priceCents)) < 1e-9) body.no_price = Math.round(priceCents);
     }
     return body;
   }
@@ -793,6 +791,35 @@ function mapKalshiOrderGroup(raw: Record<string, unknown>): KalshiOrderGroupLite
   };
 }
 
+function extractKalshiOrderGroupPayload(raw: Record<string, unknown>) {
+  const nested = raw.order_group;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    return nested as Record<string, unknown>;
+  }
+  return raw;
+}
+
+async function kalshiOrderGroupMutation(
+  paths: string[],
+  initFactory: (path: string) => RequestInit,
+): Promise<Record<string, unknown>> {
+  let lastError: Error | null = null;
+
+  for (const path of paths) {
+    try {
+      return await kalshiRequest<Record<string, unknown>>(path, initFactory(path), true);
+    } catch (error) {
+      lastError = error as Error;
+      const message = lastError.message.toLowerCase();
+      if (!message.includes("404") && !message.includes("405")) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError ?? new Error("Kalshi order-group request failed.");
+}
+
 export async function getKalshiOrderGroups(limit = 200): Promise<KalshiOrderGroupLite[]> {
   if (!hasTradingCredentials()) return [];
 
@@ -822,37 +849,42 @@ export async function getKalshiOrderGroups(limit = 200): Promise<KalshiOrderGrou
 
 export async function createKalshiOrderGroup(contractsLimit: number) {
   const safeLimit = Math.max(1, Math.floor(contractsLimit));
-  const response = await kalshiRequest<Record<string, unknown>>(
-    "/portfolio/order_groups",
-    {
+  const response = await kalshiOrderGroupMutation(
+    ["/portfolio/order_groups/create", "/portfolio/order_groups"],
+    () => ({
       method: "POST",
       body: JSON.stringify({
         contracts_limit: safeLimit,
       }),
-    },
-    true,
+    }),
   );
 
-  const mapped = mapKalshiOrderGroup(response);
-  if (!mapped) throw new Error("Kalshi order group creation returned an invalid payload.");
-  return mapped;
+  const mapped = mapKalshiOrderGroup(extractKalshiOrderGroupPayload(response));
+  if (mapped) {
+    return mapped.contracts_limit > 0
+      ? mapped
+      : {
+          ...mapped,
+          contracts_limit: safeLimit,
+        };
+  }
+  throw new Error("Kalshi order group creation returned an invalid payload.");
 }
 
 export async function updateKalshiOrderGroupLimit(orderGroupId: string, contractsLimit: number) {
   const safeLimit = Math.max(1, Math.floor(contractsLimit));
   const encoded = encodeURIComponent(orderGroupId);
-  const response = await kalshiRequest<Record<string, unknown>>(
-    `/portfolio/order_groups/${encoded}`,
-    {
-      method: "POST",
+  const response = await kalshiOrderGroupMutation(
+    [`/portfolio/order_groups/${encoded}/limit`, `/portfolio/order_groups/${encoded}`],
+    (path) => ({
+      method: path.endsWith("/limit") ? "PUT" : "POST",
       body: JSON.stringify({
         contracts_limit: safeLimit,
       }),
-    },
-    true,
+    }),
   );
 
-  return mapKalshiOrderGroup(response) ?? {
+  return mapKalshiOrderGroup(extractKalshiOrderGroupPayload(response)) ?? {
     order_group_id: orderGroupId,
     contracts_limit: safeLimit,
     is_auto_cancel_enabled: true,
@@ -861,25 +893,23 @@ export async function updateKalshiOrderGroupLimit(orderGroupId: string, contract
 
 export async function resetKalshiOrderGroup(orderGroupId: string) {
   const encoded = encodeURIComponent(orderGroupId);
-  await kalshiRequest<Record<string, unknown>>(
-    `/portfolio/order_groups/${encoded}/reset`,
-    {
-      method: "POST",
+  await kalshiOrderGroupMutation(
+    [`/portfolio/order_groups/${encoded}/reset`],
+    () => ({
+      method: "PUT",
       body: JSON.stringify({}),
-    },
-    true,
+    }),
   );
 }
 
 export async function triggerKalshiOrderGroup(orderGroupId: string) {
   const encoded = encodeURIComponent(orderGroupId);
-  await kalshiRequest<Record<string, unknown>>(
-    `/portfolio/order_groups/${encoded}/trigger`,
-    {
-      method: "POST",
+  await kalshiOrderGroupMutation(
+    [`/portfolio/order_groups/${encoded}/trigger`],
+    () => ({
+      method: "PUT",
       body: JSON.stringify({}),
-    },
-    true,
+    }),
   );
 }
 
