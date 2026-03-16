@@ -1,5 +1,7 @@
 import "server-only";
 
+import { randomUUID } from "node:crypto";
+
 import { getOptionChainSnapshots, getStockSnapshots } from "@/lib/live/alpaca";
 import {
   getKalshiDemoBalanceUsd,
@@ -11,6 +13,7 @@ import {
   placeKalshiDemoOrder,
 } from "@/lib/prediction/kalshi";
 import { refreshMarkoutTelemetry } from "@/lib/prediction/markouts";
+import { persistCandidateDecisions, persistMarketScan } from "@/lib/storage/prediction-store";
 import {
   entmaxBisect,
   logit,
@@ -3989,6 +3992,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const defaultCategories: PredictionCategory[] = [...ALL_SCAN_CATEGORIES];
   const categories = input.categories.length ? input.categories : defaultCategories;
   const mode = input.mode;
+  const runId = randomUUID();
   const controls = normalizeAutomationControls(input.controls);
   let rules = applyAutomationControls(MODE_RULES[mode], controls);
   const scanCategories = [...ALL_SCAN_CATEGORIES];
@@ -4012,6 +4016,12 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const inferredRegime = detectGlobalRegime(markets);
   const mathContext = buildMarketMathContext(markets);
   const overlayContext = await buildOverlayContext(markets);
+  await persistMarketScan({
+    markets,
+    source: "automation/market-scan",
+  }).catch(() => {
+    warnings.push("Storage warning: failed to persist market scan snapshot.");
+  });
   const markoutDiagnostics = await refreshMarkoutTelemetry(recentFills, markets).catch(() => null);
   const markoutPenalty = markoutDiagnostics
     ? Math.max(
@@ -4054,6 +4064,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     .filter((candidate): candidate is PredictionCandidate => candidate !== null);
   const generatedFilter = filterExistingPositionCandidates(generatedRaw, openPositionConstraint);
   const generated = generatedFilter.filtered;
+  await persistCandidateDecisions({
+    runId,
+    mode,
+    executeRequested: input.execute,
+    candidates: generated,
+    source: "automation/generated-candidates",
+  }).catch(() => {
+    warnings.push("Storage warning: failed to persist generated candidate decisions.");
+  });
   const availableBitcoinMarkets = markets.filter((market) => market.category === "BITCOIN").length;
   const availableBitcoinMicroMarkets = markets.filter(
     (market) => market.category === "BITCOIN" && daysUntil(market.closeTime) <= BITCOIN_MICRO_HORIZON_DAYS,
@@ -4089,6 +4108,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }
 
   let planned = applyPortfolioSizing(selected, maxDailyRiskUsd, mode);
+  await persistCandidateDecisions({
+    runId,
+    mode,
+    executeRequested: input.execute,
+    candidates: planned,
+    source: "automation/planned-candidates",
+  }).catch(() => {
+    warnings.push("Storage warning: failed to persist planned candidate decisions.");
+  });
   let actionable = actionableCandidates(planned, mode);
 
   const targetActionable = deriveActionableTarget(selected, maxDailyRiskUsd, mode);
@@ -4128,6 +4156,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       if (!selected.length) continue;
 
       planned = applyPortfolioSizing(selected, maxDailyRiskUsd, mode);
+      await persistCandidateDecisions({
+        runId,
+        mode,
+        executeRequested: input.execute,
+        candidates: planned,
+        source: `automation/throughput-recovery-step-${step}`,
+      }).catch(() => {
+        warnings.push(`Storage warning: failed to persist throughput recovery step ${step}.`);
+      });
       actionable = actionableCandidates(planned, mode);
       warnings.push(
         `Throughput recovery step ${step} applied: expanded candidate pool with relaxed thresholds to increase trade volume.`,
@@ -4159,6 +4196,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       candidateUniverse = mergeCandidateUniverse(candidateUniverse, exploratoryBoost);
       selected = selectDiversifiedCandidates(candidateUniverse, categories, rules);
       planned = applyPortfolioSizing(selected, maxDailyRiskUsd, mode);
+      await persistCandidateDecisions({
+        runId,
+        mode,
+        executeRequested: input.execute,
+        candidates: planned,
+        source: "automation/exploratory-boost",
+      }).catch(() => {
+        warnings.push("Storage warning: failed to persist exploratory boost decisions.");
+      });
       actionable = actionableCandidates(planned, mode);
       warnings.push(
         `Exploratory BUY boost applied: added ${exploratoryBoost.length} positive-EV fallback candidates to improve execution throughput.`,

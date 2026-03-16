@@ -8,6 +8,7 @@ import {
   getKalshiDemoOrders,
   kalshiConnectionStatus,
 } from "@/lib/prediction/kalshi";
+import { persistKalshiSummarySnapshot } from "@/lib/storage/prediction-store";
 
 export async function GET() {
   const status = kalshiConnectionStatus();
@@ -40,6 +41,13 @@ export async function GET() {
       ...orders.map((order) => order.ticker),
     ];
     const quotes = await getKalshiMarketQuotes(quoteTickers);
+    await persistKalshiSummarySnapshot({
+      orders,
+      fills,
+      positions,
+      quotes,
+      source: "api/live/kalshi/summary",
+    }).catch(() => undefined);
 
     return NextResponse.json({
       ok: true,
