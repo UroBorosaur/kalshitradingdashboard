@@ -16,6 +16,13 @@ export interface KalshiStreamStatus {
   lastControlPingAt: string | null;
   lastControlPongAt: string | null;
   lastResyncAt: string | null;
+  lastPrivateBootstrapAt: string | null;
+  lastPrivateEventType: string | null;
+  lastSubscriptionAckAt: string | null;
+  lastSubscriptionAckChannel: string | null;
+  lastSubscriptionAckSid: number | null;
+  lastSubscriptionAckIssue: string | null;
+  lastSubscriptionAckRaw: string | null;
   reconnectCount: number;
   desyncCount: number;
   reason: string | null;

@@ -54,6 +54,14 @@ interface WsCommandResult {
   market_tickers?: string[];
 }
 
+interface SubscriptionAck {
+  channel: string | null;
+  sid: number | null;
+  marketTickers: string[];
+  raw: string;
+  issue: string | null;
+}
+
 interface StreamSubscriptionState {
   channel: KalshiStreamChannel;
   sid: number | null;
@@ -215,6 +223,68 @@ function normalizeStreamEvent(message: Record<string, unknown>): StoredKalshiStr
   };
 }
 
+function stringifyAckPayload(message: Record<string, unknown>) {
+  try {
+    return JSON.stringify(message);
+  } catch {
+    return "[unserializable_ack_payload]";
+  }
+}
+
+export function extractWsCommandResult(message: Record<string, unknown>): WsCommandResult | null {
+  const type = String(message.type ?? "").toLowerCase();
+  const id = toNumber(message.id);
+  if (id === null || !["subscribed", "updated_subscription", "ok", "list_subscriptions"].includes(type)) {
+    return null;
+  }
+
+  const nestedPayload =
+    message.msg && typeof message.msg === "object" && !Array.isArray(message.msg)
+      ? (message.msg as Record<string, unknown>)
+      : null;
+
+  return {
+    id,
+    msg: typeof message.msg === "string" ? message.msg : undefined,
+    sid: toNumber(message.sid ?? nestedPayload?.sid) ?? undefined,
+    channel: firstDefinedString(message.channel, nestedPayload?.channel),
+    market_tickers: Array.isArray(message.market_tickers)
+      ? message.market_tickers.filter((value): value is string => typeof value === "string")
+      : Array.isArray(nestedPayload?.market_tickers)
+        ? nestedPayload.market_tickers.filter((value): value is string => typeof value === "string")
+        : undefined,
+  };
+}
+
+export function extractSubscriptionAck(message: Record<string, unknown>): SubscriptionAck | null {
+  const type = String(message.type ?? "").toLowerCase();
+  if (type !== "subscribed") return null;
+
+  const nestedPayload =
+    message.msg && typeof message.msg === "object" && !Array.isArray(message.msg)
+      ? (message.msg as Record<string, unknown>)
+      : null;
+  const channel = firstDefinedString(message.channel, nestedPayload?.channel) ?? null;
+  const sid = toNumber(message.sid ?? nestedPayload?.sid);
+  const marketTickers = Array.isArray(message.market_tickers)
+    ? message.market_tickers.filter((value): value is string => typeof value === "string").map((value) => value.toUpperCase())
+    : Array.isArray(nestedPayload?.market_tickers)
+      ? nestedPayload.market_tickers.filter((value): value is string => typeof value === "string").map((value) => value.toUpperCase())
+      : [];
+
+  let issue: string | null = null;
+  if (!channel) issue = "subscribed ack missing channel";
+  else if (sid === null) issue = "subscribed ack missing sid";
+
+  return {
+    channel,
+    sid,
+    marketTickers,
+    raw: stringifyAckPayload(message),
+    issue,
+  };
+}
+
 class KalshiStreamService {
   private socket: WebSocket | null = null;
   private connectPromise: Promise<void> | null = null;
@@ -256,6 +326,14 @@ class KalshiStreamService {
   private streamEventBuffer: StoredKalshiStreamEvent[] = [];
   private streamPersistTimer: NodeJS.Timeout | null = null;
   private streamPersistPromise: Promise<void> = Promise.resolve();
+  private privatePrimePromise: Promise<StreamPrivateStateSnapshot> | null = null;
+  private lastPrivateBootstrapAtMs = 0;
+  private lastPrivateEventType: string | null = null;
+  private lastSubscriptionAckAtMs = 0;
+  private lastSubscriptionAckChannel: string | null = null;
+  private lastSubscriptionAckSid: number | null = null;
+  private lastSubscriptionAckIssue: string | null = null;
+  private lastSubscriptionAckRaw: string | null = null;
 
   private websocketUrl() {
     return getKalshiWebSocketBaseUrl();
@@ -427,6 +505,23 @@ class KalshiStreamService {
     clearTimeout(pending.timeout);
     this.pendingRequests.delete(id);
     pending.reject(new Error(error));
+  }
+
+  private notePrivateBootstrapProgress(eventType: string) {
+    this.lastPrivateBootstrapAtMs = Date.now();
+    this.lastPrivateEventType = eventType;
+  }
+
+  private recordSubscriptionAck(ack: SubscriptionAck) {
+    this.lastSubscriptionAckAtMs = Date.now();
+    this.lastSubscriptionAckChannel = ack.channel;
+    this.lastSubscriptionAckSid = ack.sid;
+    this.lastSubscriptionAckIssue = ack.issue;
+    this.lastSubscriptionAckRaw = ack.raw;
+
+    if (ack.issue) {
+      console.warn(`Kalshi subscribed ack rejected: ${ack.issue} | raw=${ack.raw}`);
+    }
   }
 
   private upsertMarket(partial: Partial<PredictionMarketQuote> & Pick<PredictionMarketQuote, "ticker">) {
@@ -656,6 +751,7 @@ class KalshiStreamService {
       expiration_time: toIsoTime(message.expiration_time),
       last_update_time: toIsoTime(message.updated_time ?? message.ts),
     });
+    this.notePrivateBootstrapProgress("user_order");
   }
 
   private applyFillMessage(message: Record<string, unknown>) {
@@ -684,6 +780,7 @@ class KalshiStreamService {
       no_price: typeof noPrice === "number" ? probabilityToCents(noPrice <= 1 ? noPrice : noPrice / 100) : undefined,
       created_time: toIsoTime(message.created_time ?? message.ts),
     });
+    this.notePrivateBootstrapProgress("fill");
   }
 
   private applyPositionMessage(message: Record<string, unknown>) {
@@ -703,6 +800,7 @@ class KalshiStreamService {
       last_updated_ts: String(message.last_updated_ts ?? toNumber(message.ts) ?? ""),
       resting_orders_count: Math.max(0, Math.floor(toNumber(message.resting_orders_count) ?? 0)),
     });
+    this.notePrivateBootstrapProgress("market_position");
   }
 
   private applyOrderGroupUpdate(message: Record<string, unknown>) {
@@ -718,6 +816,7 @@ class KalshiStreamService {
         ? message.order_ids.filter((value): value is string => typeof value === "string")
         : undefined,
     });
+    this.notePrivateBootstrapProgress("order_group_updates");
   }
 
   private handleMessage(raw: Record<string, unknown>) {
@@ -738,27 +837,44 @@ class KalshiStreamService {
       : raw;
     this.setLastMessageNow();
 
-    if (id !== null && (type === "subscribed" || type === "updated_subscription" || type === "ok" || type === "list_subscriptions")) {
-      this.resolvePending(id, {
-        id,
-        msg: typeof raw.msg === "string" ? raw.msg : undefined,
-        sid: toNumber(raw.sid) ?? undefined,
-        channel: typeof raw.channel === "string" ? raw.channel : undefined,
-        market_tickers: Array.isArray(raw.market_tickers) ? raw.market_tickers.filter((value): value is string => typeof value === "string") : undefined,
-      });
+    const commandResult = extractWsCommandResult(raw);
+    if (commandResult?.id !== undefined) {
+      this.resolvePending(commandResult.id, commandResult);
     } else if (id !== null && type === "error") {
       this.rejectPending(id, typeof raw.msg === "string" ? raw.msg : "Kalshi websocket error");
       return;
     }
 
+    const subscriptionAck = extractSubscriptionAck(raw);
+    if (subscriptionAck) {
+      this.recordSubscriptionAck(subscriptionAck);
+      if (subscriptionAck.channel && subscriptionAck.sid !== null) {
+        const channel = subscriptionAck.channel as KalshiStreamChannel;
+        const subscription = this.subscriptions.get(channel);
+        if (subscription) {
+          subscription.sid = subscriptionAck.sid;
+          subscription.lastSeq = null;
+          if (subscriptionAck.marketTickers.length) {
+            subscription.marketTickers = new Set(subscriptionAck.marketTickers);
+          }
+          if (channel === "user_orders" || channel === "fill" || channel === "market_positions" || channel === "order_group_updates") {
+            this.notePrivateBootstrapProgress(`subscribed:${channel}`);
+          }
+        }
+      }
+      if (subscriptionAck.channel) {
+        return;
+      }
+    }
+
     if (type === "subscribed") {
-      const channel = String(raw.channel ?? "") as KalshiStreamChannel;
+      const channel = String(payload.channel ?? "") as KalshiStreamChannel;
       const subscription = this.subscriptions.get(channel);
       if (subscription) {
-        subscription.sid = toNumber(raw.sid);
+        subscription.sid = toNumber(payload.sid);
         subscription.lastSeq = null;
-        if (Array.isArray(raw.market_tickers)) {
-          subscription.marketTickers = new Set(raw.market_tickers.filter((value): value is string => typeof value === "string").map((value) => value.toUpperCase()));
+        if (Array.isArray(payload.market_tickers)) {
+          subscription.marketTickers = new Set(payload.market_tickers.filter((value): value is string => typeof value === "string").map((value) => value.toUpperCase()));
         }
       }
       return;
@@ -1031,6 +1147,25 @@ class KalshiStreamService {
     }
   }
 
+  private privateSubscriptionsReady() {
+    for (const channel of ["user_orders", "fill", "market_positions", "order_group_updates"] as const) {
+      if (!this.subscriptions.get(channel)?.sid) return false;
+    }
+    return true;
+  }
+
+  private async waitForPrivateBootstrap(startedAtMs: number) {
+    if (this.privateSubscriptionsReady() || this.lastPrivateBootstrapAtMs >= startedAtMs) return;
+
+    const deadline = Date.now() + 2_500;
+    while (Date.now() < deadline) {
+      if (this.privateSubscriptionsReady() || this.lastPrivateBootstrapAtMs >= startedAtMs) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   private async restoreSubscriptions() {
     const desiredTickers = [...this.desiredMarketTickers].slice(0, 1500);
     if (desiredTickers.length) {
@@ -1053,13 +1188,26 @@ class KalshiStreamService {
   }
 
   async primePrivate(extraQuoteTickers: string[] = []) {
-    await this.seedPrivate(extraQuoteTickers);
     extraQuoteTickers.forEach((ticker) => this.desiredMarketTickers.add(ticker.toUpperCase()));
-    if (this.desiredMarketTickers.size) {
-      await this.ensurePublicSubscriptions();
+    if (this.privatePrimePromise) {
+      await this.privatePrimePromise;
+      return this.getPrivateSnapshot(extraQuoteTickers);
     }
-    await this.ensurePrivateSubscriptions();
-    return this.getPrivateSnapshot(extraQuoteTickers);
+
+    this.privatePrimePromise = (async () => {
+      await this.seedPrivate(extraQuoteTickers);
+      if (this.desiredMarketTickers.size) {
+        await this.ensurePublicSubscriptions();
+      }
+      const bootstrapStartedAtMs = Date.now();
+      await this.ensurePrivateSubscriptions();
+      await this.waitForPrivateBootstrap(bootstrapStartedAtMs);
+      return this.getPrivateSnapshot(extraQuoteTickers);
+    })().finally(() => {
+      this.privatePrimePromise = null;
+    });
+
+    return this.privatePrimePromise;
   }
 
   getPublicMarkets(categories: PredictionCategory[], limit: number) {
@@ -1114,6 +1262,13 @@ class KalshiStreamService {
       lastControlPingAt: this.lastControlPingAtMs ? new Date(this.lastControlPingAtMs).toISOString() : null,
       lastControlPongAt: this.lastControlPongAtMs ? new Date(this.lastControlPongAtMs).toISOString() : null,
       lastResyncAt: this.lastResyncAtMs ? new Date(this.lastResyncAtMs).toISOString() : null,
+      lastPrivateBootstrapAt: this.lastPrivateBootstrapAtMs ? new Date(this.lastPrivateBootstrapAtMs).toISOString() : null,
+      lastPrivateEventType: this.lastPrivateEventType,
+      lastSubscriptionAckAt: this.lastSubscriptionAckAtMs ? new Date(this.lastSubscriptionAckAtMs).toISOString() : null,
+      lastSubscriptionAckChannel: this.lastSubscriptionAckChannel,
+      lastSubscriptionAckSid: this.lastSubscriptionAckSid,
+      lastSubscriptionAckIssue: this.lastSubscriptionAckIssue,
+      lastSubscriptionAckRaw: this.lastSubscriptionAckRaw,
       reconnectCount: this.reconnectCount,
       desyncCount: this.desyncCount,
       reason: this.lastError,
