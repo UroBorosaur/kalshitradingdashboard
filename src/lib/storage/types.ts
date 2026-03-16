@@ -56,6 +56,7 @@ export interface StoredKalshiStreamEvent {
 export interface StoredKalshiOrderEvent {
   orderId: string;
   clientOrderId?: string;
+  orderGroupId?: string;
   ticker: string;
   title?: string;
   marketStatus?: string;

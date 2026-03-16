@@ -199,6 +199,7 @@ function normalizeOrderPayload(order: KalshiOrderLite): StoredKalshiOrderEvent {
   return {
     orderId: order.order_id,
     clientOrderId: order.client_order_id,
+    orderGroupId: order.order_group_id,
     ticker: order.ticker.toUpperCase(),
     title: order.title,
     marketStatus: order.market_status,

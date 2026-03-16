@@ -8,6 +8,9 @@ import {
   kalshiConnectionStatus,
   placeKalshiDemoOrder,
 } from "@/lib/prediction/kalshi";
+import { ensureClusterOrderGuards } from "@/lib/prediction/order-groups";
+import { deriveClusterGuardSpecs } from "@/lib/prediction/order-group-rules";
+import type { ClusterGuardResult } from "@/lib/prediction/order-groups";
 import { getKalshiOpenMarketsStream, getKalshiPrivateStateStream } from "@/lib/prediction/kalshi-stream";
 import {
   estimateKalshiFeeRounded,
@@ -4351,6 +4354,29 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   // Allow live execution even when balance endpoint is temporarily unavailable.
   // Sizing will use fallback balance in that case.
   const canExecuteLive = input.execute && kalshi.connected && accountBalanceUsd > 0;
+  const exchangeClusterStakeLimitUsd = maxDailyRiskUsd * CLUSTER_LIMIT_SHARE_BY_MODE[mode];
+  let clusterGuards = new Map<string, ClusterGuardResult>();
+
+  if (canExecuteLive && actionable.length) {
+    try {
+      const guardSpecs = deriveClusterGuardSpecs({
+        actionable,
+        clusterStakeLimitUsd: exchangeClusterStakeLimitUsd,
+        executionHealthPenalty: executionHealth.markoutPenalty,
+      });
+      clusterGuards = await ensureClusterOrderGuards(guardSpecs);
+      for (const guard of clusterGuards.values()) {
+        warnings.push(...guard.warnings);
+        if (guard.triggered) {
+          warnings.push(
+            `Exchange hard-brake active for cluster ${guard.clusterKey}: order group ${guard.orderGroupId ?? "unassigned"} is blocking new orders this cycle.`,
+          );
+        }
+      }
+    } catch (error) {
+      warnings.push(`Order-group guard setup failed: ${(error as Error).message}`);
+    }
+  }
 
   const executedCandidates: PredictionCandidate[] = [];
   const actionableKeys = new Set(actionable.map((candidate) => candidateKey(candidate)));
@@ -4360,11 +4386,12 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     const key = candidateKey(candidate);
     const isActionable = actionableKeys.has(key);
     if (!isActionable) {
+      const minExecutableContracts = candidateContractStep(candidate);
       const nonActionReason =
         !isBuyVerdict(candidate.verdict)
           ? `Non-actionable verdict (${candidate.verdict ?? "WATCHLIST"}): analysis only.`
-          : candidate.recommendedContracts < 1 || candidate.recommendedStakeUsd <= 0
-            ? "Risk-cap rounding left less than one contract."
+          : candidate.recommendedContracts < minExecutableContracts || candidate.recommendedStakeUsd <= 0
+            ? "Risk-cap rounding left less than the minimum valid contract step."
             : isBuyVerdict(candidate.verdict)
             ? "Filtered out by execution queue constraints."
             : "Non-actionable candidate.";
@@ -4389,6 +4416,36 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       continue;
     }
 
+    const clusterKey = candidate.riskCluster ?? candidate.category;
+    const clusterGuard = clusterGuards.get(clusterKey);
+    if (!clusterGuard) {
+      executedCandidates.push({
+        ...candidate,
+        simulated: true,
+        executionStatus: "SKIPPED",
+        executionMessage: `Missing exchange hard-brake guard for cluster ${clusterKey}; live order blocked.`,
+      });
+      continue;
+    }
+    if (clusterGuard.triggered) {
+      executedCandidates.push({
+        ...candidate,
+        simulated: true,
+        executionStatus: "SKIPPED",
+        executionMessage: `Exchange hard-brake active for cluster ${clusterKey} via order group ${clusterGuard.orderGroupId ?? "unassigned"}.`,
+      });
+      continue;
+    }
+    if (!clusterGuard.orderGroupId) {
+      executedCandidates.push({
+        ...candidate,
+        simulated: true,
+        executionStatus: "SKIPPED",
+        executionMessage: `Cluster ${clusterKey} did not receive an order_group_id; live order blocked.`,
+      });
+      continue;
+    }
+
     try {
       await placeKalshiDemoOrder({
         ticker: candidate.ticker,
@@ -4396,6 +4453,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         count: candidate.recommendedContracts,
         limitPriceCents: candidate.limitPriceCents,
         contractStep: candidate.contractStep,
+        orderGroupId: clusterGuard.orderGroupId,
       });
 
       executedStake += candidate.recommendedStakeUsd;
@@ -4404,7 +4462,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         ...candidate,
         simulated: false,
         executionStatus: "PLACED",
-        executionMessage: `Order placed on Kalshi demo (${candidate.recommendedContracts} contracts).`,
+        executionMessage: `Order placed on Kalshi demo (${candidate.recommendedContracts} contracts, group ${clusterGuard.orderGroupId}).`,
       });
     } catch (error) {
       executedCandidates.push({

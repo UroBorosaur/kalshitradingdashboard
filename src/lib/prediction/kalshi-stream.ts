@@ -26,6 +26,7 @@ import { persistStreamEvents } from "@/lib/storage/prediction-store";
 import type { StoredKalshiStreamEvent } from "@/lib/storage/types";
 import type {
   KalshiFillLite,
+  KalshiOrderGroupLite,
   KalshiOrderLite,
   KalshiPositionLite,
   KalshiQuoteLite,
@@ -43,7 +44,7 @@ const RECONNECT_BASE_DELAY_MS = 1_000;
 const STREAM_PERSIST_FLUSH_MS = 250;
 const STREAM_PERSIST_BATCH_SIZE = 100;
 
-type KalshiStreamChannel = "ticker" | "orderbook_delta" | "user_orders" | "fill" | "market_positions";
+type KalshiStreamChannel = "ticker" | "orderbook_delta" | "user_orders" | "fill" | "market_positions" | "order_group_updates";
 
 interface WsCommandResult {
   id?: number;
@@ -245,11 +246,13 @@ class KalshiStreamService {
     ["user_orders", { channel: "user_orders", sid: null, marketTickers: new Set(), lastSeq: null }],
     ["fill", { channel: "fill", sid: null, marketTickers: new Set(), lastSeq: null }],
     ["market_positions", { channel: "market_positions", sid: null, marketTickers: new Set(), lastSeq: null }],
+    ["order_group_updates", { channel: "order_group_updates", sid: null, marketTickers: new Set(), lastSeq: null }],
   ]);
   private marketStates = new Map<string, StreamMarketState>();
   private orders = new Map<string, KalshiOrderLite>();
   private fills = new Map<string, KalshiFillLite>();
   private positions = new Map<string, KalshiPositionLite>();
+  private orderGroups = new Map<string, KalshiOrderGroupLite>();
   private streamEventBuffer: StoredKalshiStreamEvent[] = [];
   private streamPersistTimer: NodeJS.Timeout | null = null;
   private streamPersistPromise: Promise<void> = Promise.resolve();
@@ -637,6 +640,7 @@ class KalshiStreamService {
     this.orders.set(orderId, {
       order_id: orderId,
       client_order_id: typeof message.client_order_id === "string" ? message.client_order_id : undefined,
+      order_group_id: typeof message.order_group_id === "string" ? message.order_group_id : undefined,
       ticker,
       title: this.marketStates.get(ticker)?.market.title,
       market_status: typeof message.market_status === "string" ? message.market_status : this.marketStates.get(ticker)?.market.status,
@@ -698,6 +702,21 @@ class KalshiStreamService {
       fees_paid_dollars: typeof message.fees_paid_dollars === "string" ? message.fees_paid_dollars : undefined,
       last_updated_ts: String(message.last_updated_ts ?? toNumber(message.ts) ?? ""),
       resting_orders_count: Math.max(0, Math.floor(toNumber(message.resting_orders_count) ?? 0)),
+    });
+  }
+
+  private applyOrderGroupUpdate(message: Record<string, unknown>) {
+    const orderGroupId = String(message.order_group_id ?? message.id ?? "").trim();
+    if (!orderGroupId) return;
+
+    this.orderGroups.set(orderGroupId, {
+      order_group_id: orderGroupId,
+      contracts_limit: Math.max(0, Math.floor(toNumber(message.contracts_limit ?? message.limit) ?? 0)),
+      is_auto_cancel_enabled: message.is_auto_cancel_enabled !== false,
+      status: typeof message.status === "string" ? message.status : undefined,
+      order_ids: Array.isArray(message.order_ids)
+        ? message.order_ids.filter((value): value is string => typeof value === "string")
+        : undefined,
     });
   }
 
@@ -763,6 +782,10 @@ class KalshiStreamService {
         return;
       case "market_position":
         this.applyPositionMessage(payload);
+        return;
+      case "order_group_update":
+      case "order_group_updates":
+        this.applyOrderGroupUpdate(payload);
         return;
       default:
         return;
@@ -1000,7 +1023,7 @@ class KalshiStreamService {
 
   private async ensurePrivateSubscriptions() {
     await this.ensureConnected();
-    for (const channel of ["user_orders", "fill", "market_positions"] as const) {
+    for (const channel of ["user_orders", "fill", "market_positions", "order_group_updates"] as const) {
       const subscription = this.subscriptions.get(channel);
       if (!subscription?.sid) {
         await this.subscribeChannel(channel);
@@ -1019,6 +1042,7 @@ class KalshiStreamService {
       await this.subscribeChannel("user_orders");
       await this.subscribeChannel("fill");
       await this.subscribeChannel("market_positions");
+      await this.subscribeChannel("order_group_updates");
     }
   }
 

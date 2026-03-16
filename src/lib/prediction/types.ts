@@ -270,12 +270,22 @@ export interface KalshiOrderRequest {
   count: number;
   limitPriceCents: number;
   contractStep?: number;
+  orderGroupId?: string;
   clientOrderId?: string;
+}
+
+export interface KalshiOrderGroupLite {
+  order_group_id: string;
+  contracts_limit: number;
+  is_auto_cancel_enabled: boolean;
+  status?: string;
+  order_ids?: string[];
 }
 
 export interface KalshiOrderLite {
   order_id: string;
   client_order_id?: string;
+  order_group_id?: string;
   ticker: string;
   title?: string;
   market_status?: string;

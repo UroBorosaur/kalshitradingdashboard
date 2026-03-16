@@ -17,6 +17,7 @@ import {
 } from "@/lib/prediction/fixed-point";
 import type {
   KalshiFillLite,
+  KalshiOrderGroupLite,
   KalshiOrderLite,
   KalshiOrderRequest,
   KalshiPositionLite,
@@ -506,6 +507,7 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
       type: "limit",
       count_fp: formatKalshiCountFp(count),
     };
+    if (order.orderGroupId?.trim()) body.order_group_id = order.orderGroupId.trim();
     if (Number.isInteger(count)) body.count = Math.max(1, Math.floor(count));
     if (includeClientOrderId) body.client_order_id = clientOrderId;
     const priceDollars = formatKalshiPriceDollars(priceCents / 100);
@@ -743,6 +745,7 @@ function mapKalshiOrder(raw: Record<string, unknown>): KalshiOrderLite | null {
   return {
     order_id: orderId,
     client_order_id: raw.client_order_id ? String(raw.client_order_id) : undefined,
+    order_group_id: raw.order_group_id ? String(raw.order_group_id) : undefined,
     ticker,
     title: raw.title ? String(raw.title) : undefined,
     market_status: raw.market_status ? String(raw.market_status) : undefined,
@@ -758,6 +761,126 @@ function mapKalshiOrder(raw: Record<string, unknown>): KalshiOrderLite | null {
     expiration_time: raw.expiration_time ? String(raw.expiration_time) : undefined,
     last_update_time: raw.last_update_time ? String(raw.last_update_time) : undefined,
   };
+}
+
+interface KalshiOrderGroupsResponse {
+  order_groups?: Record<string, unknown>[];
+  cursor?: string;
+}
+
+function mapKalshiOrderGroup(raw: Record<string, unknown>): KalshiOrderGroupLite | null {
+  const orderGroupId = String(raw.order_group_id ?? raw.id ?? "").trim();
+  if (!orderGroupId) return null;
+
+  return {
+    order_group_id: orderGroupId,
+    contracts_limit: Math.max(
+      0,
+      Math.floor(
+        firstDefinedNumber(
+          toNumber(raw.contracts_limit),
+          toNumber(raw.contracts_limit_fp),
+          toNumber(raw.limit),
+          null,
+        ) ?? 0,
+      ),
+    ),
+    is_auto_cancel_enabled: raw.is_auto_cancel_enabled !== false,
+    status: raw.status ? String(raw.status) : undefined,
+    order_ids: Array.isArray(raw.order_ids)
+      ? raw.order_ids.filter((value): value is string => typeof value === "string")
+      : undefined,
+  };
+}
+
+export async function getKalshiOrderGroups(limit = 200): Promise<KalshiOrderGroupLite[]> {
+  if (!hasTradingCredentials()) return [];
+
+  const safeLimit = Math.min(500, Math.max(1, Math.floor(limit)));
+  const out: KalshiOrderGroupLite[] = [];
+  let cursor = "";
+  let pages = 0;
+
+  while (out.length < safeLimit && pages < 8) {
+    const params = new URLSearchParams({ limit: String(Math.min(100, safeLimit - out.length)) });
+    if (cursor) params.set("cursor", cursor);
+
+    const response = await kalshiRequest<KalshiOrderGroupsResponse>(`/portfolio/order_groups?${params.toString()}`, undefined, true);
+    const rows = (Array.isArray(response.order_groups) ? response.order_groups : [])
+      .map((row) => mapKalshiOrderGroup(row))
+      .filter((row): row is KalshiOrderGroupLite => row !== null);
+
+    out.push(...rows);
+
+    if (!response.cursor || !rows.length) break;
+    cursor = response.cursor;
+    pages += 1;
+  }
+
+  return dedupeById(out, (row) => row.order_group_id).slice(0, safeLimit);
+}
+
+export async function createKalshiOrderGroup(contractsLimit: number) {
+  const safeLimit = Math.max(1, Math.floor(contractsLimit));
+  const response = await kalshiRequest<Record<string, unknown>>(
+    "/portfolio/order_groups",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        contracts_limit: safeLimit,
+      }),
+    },
+    true,
+  );
+
+  const mapped = mapKalshiOrderGroup(response);
+  if (!mapped) throw new Error("Kalshi order group creation returned an invalid payload.");
+  return mapped;
+}
+
+export async function updateKalshiOrderGroupLimit(orderGroupId: string, contractsLimit: number) {
+  const safeLimit = Math.max(1, Math.floor(contractsLimit));
+  const encoded = encodeURIComponent(orderGroupId);
+  const response = await kalshiRequest<Record<string, unknown>>(
+    `/portfolio/order_groups/${encoded}`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        contracts_limit: safeLimit,
+      }),
+    },
+    true,
+  );
+
+  return mapKalshiOrderGroup(response) ?? {
+    order_group_id: orderGroupId,
+    contracts_limit: safeLimit,
+    is_auto_cancel_enabled: true,
+  };
+}
+
+export async function resetKalshiOrderGroup(orderGroupId: string) {
+  const encoded = encodeURIComponent(orderGroupId);
+  await kalshiRequest<Record<string, unknown>>(
+    `/portfolio/order_groups/${encoded}/reset`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+    true,
+  );
+}
+
+export async function triggerKalshiOrderGroup(orderGroupId: string) {
+  const encoded = encodeURIComponent(orderGroupId);
+  await kalshiRequest<Record<string, unknown>>(
+    `/portfolio/order_groups/${encoded}/trigger`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+    true,
+  );
 }
 
 function mapKalshiFill(raw: Record<string, unknown>): KalshiFillLite | null {
