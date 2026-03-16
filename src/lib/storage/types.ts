@@ -196,6 +196,16 @@ export interface PredictionReplayDay {
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
 
+export type PredictionReplayEvent =
+  | PredictionStorageEnvelope<StoredKalshiFillEvent>
+  | PredictionStorageEnvelope<StoredKalshiOrderEvent>
+  | PredictionStorageEnvelope<StoredKalshiPositionEvent>
+  | PredictionStorageEnvelope<StoredKalshiQuoteEvent>
+  | PredictionStorageEnvelope<StoredOrderbookEvent>
+  | PredictionStorageEnvelope<StoredCandidateDecisionEvent>
+  | PredictionStorageEnvelope<StoredResolutionEvent>
+  | PredictionStorageEnvelope<StoredMarkoutEvent>;
+
 export function toStoredCandidateDecisionPayload(
   runId: string,
   mode: AutomationMode,

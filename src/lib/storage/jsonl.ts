@@ -1,12 +1,17 @@
 import "server-only";
 
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { PredictionStorageEnvelope, PredictionStorageLayer, PredictionStorageStream } from "@/lib/storage/types";
 
 const STORAGE_ROOT = path.join(process.cwd(), "data", "prediction");
 const STATE_ROOT = path.join(STORAGE_ROOT, "state");
+const STATE_LOCK_ROOT = path.join(STATE_ROOT, "locks");
+const PROCESS_LOCKS = new Map<string, Promise<void>>();
+const LOCK_STALE_MS = 30_000;
+const LOCK_RETRY_MS = 50;
+const LOCK_MAX_ATTEMPTS = 120;
 
 function isoDay(value: string | number | Date) {
   const date = value instanceof Date ? value : new Date(value);
@@ -19,6 +24,79 @@ function filePathFor(layer: PredictionStorageLayer, stream: PredictionStorageStr
 
 function statePath(name: string) {
   return path.join(STATE_ROOT, `${name}.json`);
+}
+
+function stateLockPath(name: string) {
+  return path.join(STATE_LOCK_ROOT, `${name}.lock`);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function atomicWriteFile(filePath: string, contents: string) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, contents, "utf8");
+  await rename(tempPath, filePath);
+}
+
+async function acquireFileLock(name: string) {
+  const lockPath = stateLockPath(name);
+  await mkdir(path.dirname(lockPath), { recursive: true });
+
+  for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const handle = await open(lockPath, "wx");
+      await handle.writeFile(JSON.stringify({
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+      }));
+      await handle.close();
+
+      return async () => {
+        await rm(lockPath, { force: true });
+      };
+    } catch {
+      try {
+        const details = await stat(lockPath);
+        if (Date.now() - details.mtimeMs > LOCK_STALE_MS) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      await sleep(LOCK_RETRY_MS);
+    }
+  }
+
+  throw new Error(`Timed out waiting for storage lock "${name}".`);
+}
+
+export async function withStorageStateWriter<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const prior = PROCESS_LOCKS.get(name) ?? Promise.resolve();
+
+  let releaseProcessLock!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseProcessLock = resolve;
+  });
+  PROCESS_LOCKS.set(name, prior.finally(() => current));
+
+  await prior.catch(() => undefined);
+  const releaseFileLock = await acquireFileLock(name);
+
+  try {
+    return await fn();
+  } finally {
+    await releaseFileLock().catch(() => undefined);
+    releaseProcessLock();
+    if (PROCESS_LOCKS.get(name) === current) {
+      PROCESS_LOCKS.delete(name);
+    }
+  }
 }
 
 export async function appendPredictionEvents<TPayload>(
@@ -105,6 +183,5 @@ export async function loadStorageState<TState>(name: string, fallback: TState): 
 
 export async function saveStorageState<TState>(name: string, state: TState) {
   const filePath = statePath(name);
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, JSON.stringify(state), "utf8");
+  await atomicWriteFile(filePath, JSON.stringify(state));
 }

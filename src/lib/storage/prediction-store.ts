@@ -2,9 +2,17 @@ import "server-only";
 
 import { createHash, randomUUID } from "node:crypto";
 
-import { appendPredictionEvents, loadStorageState, readPredictionEventsForDay, readPredictionEventsSince, saveStorageState } from "@/lib/storage/jsonl";
+import {
+  appendPredictionEvents,
+  loadStorageState,
+  readPredictionEventsForDay,
+  readPredictionEventsSince,
+  saveStorageState,
+  withStorageStateWriter,
+} from "@/lib/storage/jsonl";
 import type {
   PredictionReplayDay,
+  PredictionReplayEvent,
   PredictionStorageEnvelope,
   StoredCandidateDecisionEvent,
   StoredKalshiFillEvent,
@@ -20,15 +28,33 @@ import type { AutomationMode, KalshiFillLite, KalshiOrderLite, KalshiPositionLit
 
 const SCHEMA_VERSION = 1;
 const STATE_NAME = "prediction-ingestion";
+const FILL_STATE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+const HASH_STATE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const RESOLUTION_STATE_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
+const MAX_FILL_STATE_ENTRIES = 20_000;
+const MAX_HASH_STATE_ENTRIES = 50_000;
+const MAX_RESOLUTION_STATE_ENTRIES = 10_000;
+
+interface TimestampedHashState {
+  hash: string;
+  updatedAtMs: number;
+}
+
+interface TimestampedResolutionState {
+  key: string;
+  updatedAtMs: number;
+}
 
 interface PredictionIngestionState {
-  seenFillIds: Record<string, true>;
-  resolutionKeys: Record<string, string>;
-  latestHashes: Record<string, string>;
+  stateVersion: number;
+  seenFillIds: Record<string, number>;
+  resolutionKeys: Record<string, TimestampedResolutionState>;
+  latestHashes: Record<string, TimestampedHashState>;
 }
 
 function defaultState(): PredictionIngestionState {
   return {
+    stateVersion: 2,
     seenFillIds: {},
     resolutionKeys: {},
     latestHashes: {},
@@ -37,6 +63,91 @@ function defaultState(): PredictionIngestionState {
 
 function hashPayload(payload: unknown) {
   return createHash("sha1").update(JSON.stringify(payload)).digest("hex");
+}
+
+function normalizeIngestionState(rawState: unknown): PredictionIngestionState {
+  const fallback = defaultState();
+  if (!rawState || typeof rawState !== "object") return fallback;
+
+  const candidate = rawState as {
+    stateVersion?: number;
+    seenFillIds?: Record<string, boolean | number>;
+    resolutionKeys?: Record<string, string | TimestampedResolutionState>;
+    latestHashes?: Record<string, string | TimestampedHashState>;
+  };
+
+  const seenFillIds = Object.fromEntries(
+    Object.entries(candidate.seenFillIds ?? {}).map(([key, value]) => [
+      key,
+      typeof value === "number" && Number.isFinite(value) ? value : Date.now(),
+    ]),
+  );
+  const resolutionKeys = Object.fromEntries(
+    Object.entries(candidate.resolutionKeys ?? {}).map(([key, value]) => [
+      key,
+      typeof value === "string"
+        ? { key: value, updatedAtMs: Date.now() }
+        : {
+            key: value?.key ?? "",
+            updatedAtMs: Number.isFinite(value?.updatedAtMs) ? value.updatedAtMs : Date.now(),
+          },
+    ]),
+  );
+  const latestHashes = Object.fromEntries(
+    Object.entries(candidate.latestHashes ?? {}).map(([key, value]) => [
+      key,
+      typeof value === "string"
+        ? { hash: value, updatedAtMs: Date.now() }
+        : {
+            hash: value?.hash ?? "",
+            updatedAtMs: Number.isFinite(value?.updatedAtMs) ? value.updatedAtMs : Date.now(),
+          },
+    ]),
+  );
+
+  return {
+    stateVersion: 2,
+    seenFillIds,
+    resolutionKeys,
+    latestHashes,
+  };
+}
+
+function pruneTimestampedRecord<TEntry extends { updatedAtMs: number }>(
+  record: Record<string, TEntry>,
+  minUpdatedAtMs: number,
+  maxEntries: number,
+) {
+  const entries = Object.entries(record)
+    .filter(([, value]) => Number.isFinite(value.updatedAtMs) && value.updatedAtMs >= minUpdatedAtMs)
+    .sort((a, b) => b[1].updatedAtMs - a[1].updatedAtMs);
+
+  return Object.fromEntries(entries.slice(0, maxEntries));
+}
+
+function pruneFillState(record: Record<string, number>, minUpdatedAtMs: number, maxEntries: number) {
+  const entries = Object.entries(record)
+    .filter(([, updatedAtMs]) => Number.isFinite(updatedAtMs) && updatedAtMs >= minUpdatedAtMs)
+    .sort((a, b) => b[1] - a[1]);
+
+  return Object.fromEntries(entries.slice(0, maxEntries));
+}
+
+function compactIngestionState(state: PredictionIngestionState, nowMs = Date.now()): PredictionIngestionState {
+  return {
+    stateVersion: 2,
+    seenFillIds: pruneFillState(state.seenFillIds, nowMs - FILL_STATE_RETENTION_MS, MAX_FILL_STATE_ENTRIES),
+    resolutionKeys: pruneTimestampedRecord(
+      state.resolutionKeys,
+      nowMs - RESOLUTION_STATE_RETENTION_MS,
+      MAX_RESOLUTION_STATE_ENTRIES,
+    ),
+    latestHashes: pruneTimestampedRecord(
+      state.latestHashes,
+      nowMs - HASH_STATE_RETENTION_MS,
+      MAX_HASH_STATE_ENTRIES,
+    ),
+  };
 }
 
 function makeEnvelope<TPayload>(
@@ -156,10 +267,13 @@ function normalizeOrderbookPayload(market: PredictionMarketQuote): StoredOrderbo
 }
 
 async function withState<T>(fn: (state: PredictionIngestionState) => Promise<T>) {
-  const state = await loadStorageState<PredictionIngestionState>(STATE_NAME, defaultState());
-  const result = await fn(state);
-  await saveStorageState(STATE_NAME, state);
-  return result;
+  return withStorageStateWriter(STATE_NAME, async () => {
+    const loadedState = await loadStorageState<PredictionIngestionState>(STATE_NAME, defaultState());
+    const state = compactIngestionState(normalizeIngestionState(loadedState));
+    const result = await fn(state);
+    await saveStorageState(STATE_NAME, compactIngestionState(state));
+    return result;
+  });
 }
 
 export async function persistKalshiSummarySnapshot(args: {
@@ -170,6 +284,7 @@ export async function persistKalshiSummarySnapshot(args: {
   source: string;
 }) {
   await withState(async (state) => {
+    const nowMs = Date.now();
     const orderEvents: Array<PredictionStorageEnvelope<StoredKalshiOrderEvent>> = [];
     const fillEvents: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>> = [];
     const positionEvents: Array<PredictionStorageEnvelope<StoredKalshiPositionEvent>> = [];
@@ -180,8 +295,8 @@ export async function persistKalshiSummarySnapshot(args: {
       const payload = normalizeOrderPayload(order);
       const entityKey = `order:${payload.orderId}`;
       const hash = hashPayload(payload);
-      if (state.latestHashes[entityKey] === hash) continue;
-      state.latestHashes[entityKey] = hash;
+      if (state.latestHashes[entityKey]?.hash === hash) continue;
+      state.latestHashes[entityKey] = { hash, updatedAtMs: nowMs };
       orderEvents.push(makeEnvelope("orders", "raw", args.source, entityKey, payload));
     }
 
@@ -189,7 +304,7 @@ export async function persistKalshiSummarySnapshot(args: {
       const payload = normalizeFillPayload(fill);
       const entityKey = `fill:${payload.fillId}`;
       if (state.seenFillIds[payload.fillId]) continue;
-      state.seenFillIds[payload.fillId] = true;
+      state.seenFillIds[payload.fillId] = nowMs;
       fillEvents.push(makeEnvelope("fills", "raw", args.source, entityKey, payload));
     }
 
@@ -197,8 +312,8 @@ export async function persistKalshiSummarySnapshot(args: {
       const payload = normalizePositionPayload(position);
       const entityKey = `position:${payload.ticker}`;
       const hash = hashPayload(payload);
-      if (state.latestHashes[entityKey] === hash) continue;
-      state.latestHashes[entityKey] = hash;
+      if (state.latestHashes[entityKey]?.hash === hash) continue;
+      state.latestHashes[entityKey] = { hash, updatedAtMs: nowMs };
       positionEvents.push(makeEnvelope("positions", "raw", args.source, entityKey, payload));
     }
 
@@ -206,15 +321,15 @@ export async function persistKalshiSummarySnapshot(args: {
       const payload = normalizeQuotePayload(quote);
       const entityKey = `quote:summary:${payload.ticker}`;
       const hash = hashPayload(payload);
-      if (state.latestHashes[entityKey] !== hash) {
-        state.latestHashes[entityKey] = hash;
+      if (state.latestHashes[entityKey]?.hash !== hash) {
+        state.latestHashes[entityKey] = { hash, updatedAtMs: nowMs };
         quoteEvents.push(makeEnvelope("quotes", "raw", args.source, entityKey, payload));
       }
 
       if (payload.settlementResult || (payload.marketStatus ?? "").toLowerCase().includes("settled")) {
         const resolutionKey = `${payload.ticker}:${payload.settlementResult ?? payload.marketStatus ?? "resolved"}`;
-        if (state.resolutionKeys[payload.ticker] !== resolutionKey) {
-          state.resolutionKeys[payload.ticker] = resolutionKey;
+        if (state.resolutionKeys[payload.ticker]?.key !== resolutionKey) {
+          state.resolutionKeys[payload.ticker] = { key: resolutionKey, updatedAtMs: nowMs };
           resolutionEvents.push(
             makeEnvelope("resolutions", "raw", args.source, `resolution:${payload.ticker}`, {
               ticker: payload.ticker,
@@ -244,6 +359,7 @@ export async function persistMarketScan(args: {
   source: string;
 }) {
   await withState(async (state) => {
+    const nowMs = Date.now();
     const quoteEvents: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>> = [];
     const orderbookEvents: Array<PredictionStorageEnvelope<StoredOrderbookEvent>> = [];
     const resolutionEvents: Array<PredictionStorageEnvelope<StoredResolutionEvent>> = [];
@@ -252,23 +368,23 @@ export async function persistMarketScan(args: {
       const quotePayload = normalizeQuotePayload(market);
       const quoteKey = `quote:scan:${quotePayload.ticker}`;
       const quoteHash = hashPayload(quotePayload);
-      if (state.latestHashes[quoteKey] !== quoteHash) {
-        state.latestHashes[quoteKey] = quoteHash;
+      if (state.latestHashes[quoteKey]?.hash !== quoteHash) {
+        state.latestHashes[quoteKey] = { hash: quoteHash, updatedAtMs: nowMs };
         quoteEvents.push(makeEnvelope("quotes", "raw", args.source, quoteKey, quotePayload));
       }
 
       const bookPayload = normalizeOrderbookPayload(market);
       const bookKey = `book:${bookPayload.ticker}`;
       const bookHash = hashPayload(bookPayload);
-      if (state.latestHashes[bookKey] !== bookHash) {
-        state.latestHashes[bookKey] = bookHash;
+      if (state.latestHashes[bookKey]?.hash !== bookHash) {
+        state.latestHashes[bookKey] = { hash: bookHash, updatedAtMs: nowMs };
         orderbookEvents.push(makeEnvelope("orderbook_events", "raw", args.source, bookKey, bookPayload));
       }
 
       if ((market.status ?? "").toLowerCase().includes("settled")) {
         const resolutionKey = `${market.ticker}:${market.status}`;
-        if (state.resolutionKeys[market.ticker] !== resolutionKey) {
-          state.resolutionKeys[market.ticker] = resolutionKey;
+        if (state.resolutionKeys[market.ticker]?.key !== resolutionKey) {
+          state.resolutionKeys[market.ticker] = { key: resolutionKey, updatedAtMs: nowMs };
           resolutionEvents.push(
             makeEnvelope("resolutions", "raw", args.source, `resolution:${market.ticker}`, {
               ticker: market.ticker,
@@ -361,4 +477,51 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     resolutions,
     markouts,
   };
+}
+
+const REPLAY_STREAM_ORDER: Record<PredictionReplayEvent["stream"], number> = {
+  fills: 0,
+  orders: 1,
+  positions: 2,
+  quotes: 3,
+  orderbook_events: 4,
+  candidate_decisions: 5,
+  resolutions: 6,
+  markouts: 7,
+};
+
+function compareReplayEvents(a: PredictionReplayEvent, b: PredictionReplayEvent) {
+  const recordedAtDelta = new Date(a.recordedAt).getTime() - new Date(b.recordedAt).getTime();
+  if (recordedAtDelta !== 0) return recordedAtDelta;
+
+  if (a.layer !== b.layer) return a.layer.localeCompare(b.layer);
+
+  const streamDelta = REPLAY_STREAM_ORDER[a.stream] - REPLAY_STREAM_ORDER[b.stream];
+  if (streamDelta !== 0) return streamDelta;
+
+  const entityKeyDelta = a.entityKey.localeCompare(b.entityKey);
+  if (entityKeyDelta !== 0) return entityKeyDelta;
+
+  return a.id.localeCompare(b.id);
+}
+
+export async function loadPredictionReplayTimeline(day: string): Promise<PredictionReplayEvent[]> {
+  const replayDay = await loadPredictionReplayDay(day);
+  return [
+    ...replayDay.fills,
+    ...replayDay.orders,
+    ...replayDay.positions,
+    ...replayDay.quotes,
+    ...replayDay.orderbookEvents,
+    ...replayDay.candidateDecisions,
+    ...replayDay.resolutions,
+    ...replayDay.markouts,
+  ].sort(compareReplayEvents);
+}
+
+export async function* iteratePredictionReplayDay(day: string): AsyncGenerator<PredictionReplayEvent> {
+  const timeline = await loadPredictionReplayTimeline(day);
+  for (const event of timeline) {
+    yield event;
+  }
 }
