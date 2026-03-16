@@ -448,6 +448,18 @@ export async function readStoredMarkoutsSince(sinceMs: number) {
   return readPredictionEventsSince<StoredMarkoutEvent>("derived", "markouts", sinceMs);
 }
 
+export async function readStoredCandidateDecisionsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredCandidateDecisionEvent>("raw", "candidate_decisions", sinceMs);
+}
+
+export async function readStoredOrdersSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredKalshiOrderEvent>("raw", "orders", sinceMs);
+}
+
+export async function readStoredFillsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredKalshiFillEvent>("raw", "fills", sinceMs);
+}
+
 export async function persistMarkoutEvents(
   source: string,
   markouts: StoredMarkoutEvent[],

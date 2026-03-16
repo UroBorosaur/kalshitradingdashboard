@@ -11,7 +11,7 @@ import {
 import { ensureClusterOrderGuards } from "@/lib/prediction/order-groups";
 import { deriveClusterGuardSpecs } from "@/lib/prediction/order-group-rules";
 import type { ClusterGuardResult } from "@/lib/prediction/order-groups";
-import { getKalshiOpenMarketsStream, getKalshiPrivateStateStream } from "@/lib/prediction/kalshi-stream";
+import { getKalshiOpenMarketsStream, getKalshiPrivateStateStream, getKalshiStreamStatus } from "@/lib/prediction/kalshi-stream";
 import {
   estimateKalshiFeeRounded,
   marketContractStep,
@@ -32,6 +32,8 @@ import {
 import type {
   AutomationControls,
   AutomationMode,
+  ExecutionBootstrapMode,
+  ExecutionHealthRegime,
   AutomationRunInput,
   AutomationRunSummary,
   CalibrationMethod,
@@ -347,6 +349,7 @@ interface ExecutionAlphaEstimate {
   quoteWidening: number;
   staleHazard: number;
   toxicityScore: number;
+  inventorySkew: number;
   notes: string[];
 }
 
@@ -421,8 +424,11 @@ interface OverlayContext {
 interface ExecutionHealthContext {
   markoutPenalty: number;
   scorePenalty: number;
+  regime: ExecutionHealthRegime;
   warnings: string[];
 }
+
+const REQUIRED_PRIVATE_STREAM_CHANNELS = ["user_orders", "fill", "market_positions", "order_group_updates"] as const;
 
 function normalizeAutomationControls(input?: Partial<AutomationControls>): AutomationControls {
   return {
@@ -529,6 +535,33 @@ function deriveRiskCluster(market: PredictionMarketQuote) {
   return `${market.category}:${titleBase || tickerBase || market.ticker}`;
 }
 
+function deriveExecutionHealthRegime(markoutPenalty: number, sampleCount: number): ExecutionHealthRegime {
+  if (sampleCount >= 8 && markoutPenalty > 0.03) return "DEFENSIVE";
+  if (sampleCount >= 4 && markoutPenalty > 0.01) return "TIGHTENED";
+  return "NORMAL";
+}
+
+function deriveBootstrapMode(): ExecutionBootstrapMode {
+  const status = getKalshiStreamStatus();
+  if (!status.primedPrivate) return "UNAVAILABLE";
+
+  const ackedChannels = new Set(
+    status.subscriptions
+      .filter((subscription) => subscription.sid !== null)
+      .map((subscription) => subscription.channel),
+  );
+
+  const fullyAcked = REQUIRED_PRIVATE_STREAM_CHANNELS.every((channel) => ackedChannels.has(channel));
+  return fullyAcked ? "ACKED" : "EVENT_PRIMED";
+}
+
+function buildAutomationClientOrderId(runId: string, candidate: Pick<PredictionCandidate, "ticker" | "side">, index: number) {
+  const compactRunId = runId.replace(/-/g, "").slice(0, 12);
+  const ticker = candidate.ticker.replace(/[^A-Za-z0-9]+/g, "").slice(0, 24);
+  const side = candidate.side === "YES" ? "Y" : "N";
+  return `auto-${compactRunId}-${index.toString(36)}-${side}-${ticker}`.slice(0, 48);
+}
+
 function buildExecutionHealthContext(markoutPenalty: number, sampleCount: number) {
   const boundedPenalty = clamp(markoutPenalty, 0, 0.22);
   const warnings: string[] = [];
@@ -541,6 +574,7 @@ function buildExecutionHealthContext(markoutPenalty: number, sampleCount: number
   return {
     markoutPenalty: boundedPenalty,
     scorePenalty: clamp(boundedPenalty * 0.85, 0, 0.18),
+    regime: deriveExecutionHealthRegime(boundedPenalty, sampleCount),
     warnings,
   } satisfies ExecutionHealthContext;
 }
@@ -1786,6 +1820,7 @@ function estimateExecutionAlpha(args: {
     quoteWidening: Number(uncertaintyWidening.toFixed(6)),
     staleHazard: Number(staleHazard.toFixed(6)),
     toxicityScore: Number(toxicityScore.toFixed(6)),
+    inventorySkew: Number(inventorySkew.toFixed(6)),
     notes,
   };
 }
@@ -3438,6 +3473,7 @@ function candidateFromMarket(
       role: executionAlpha.assumedRole,
       quoteWidening: Number(executionAlpha.quoteWidening.toFixed(6)),
       staleHazard: Number(executionAlpha.staleHazard.toFixed(6)),
+      inventorySkew: Number(executionAlpha.inventorySkew.toFixed(6)),
     },
     rationale,
     probabilityTransform: probabilityEstimate.probabilityTransform,
@@ -3453,6 +3489,8 @@ function candidateFromMarket(
     timeToCloseDays,
     strategicBreakdown,
     simulated: true,
+    executionHealthRegime: executionHealth.regime,
+    executionHealthPenalty: Number(executionHealth.markoutPenalty.toFixed(6)),
     executionStatus: "SKIPPED",
     executionMessage: usedRulebookArbitrage
       ? "Rulebook arbitrage candidate: robust interval cleared price after cost margin."
@@ -4070,10 +4108,14 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const recentFills = livePrivateState.fills;
   const accountBalanceUsd = account.balanceUsd;
   const openPositionConstraint = buildOpenPositionConstraint(existingPositions, existingOrders);
+  const bootstrapMode = deriveBootstrapMode();
 
   const warnings: string[] = [];
   if (!btcSpot) warnings.push("BTC spot feed unavailable; using order-book fallback model for bitcoin contracts.");
   if (!account.fromBroker) warnings.push("Kalshi balance unavailable; using conservative placeholder balance for planning.");
+  if (input.execute && bootstrapMode === "EVENT_PRIMED") {
+    warnings.push("Private stream bootstrap is event-primed rather than fully acked; execution attribution will flag this run.");
+  }
 
   const inferredRegime = detectGlobalRegime(markets);
   const mathContext = buildMarketMathContext(markets);
@@ -4381,8 +4423,13 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const executedCandidates: PredictionCandidate[] = [];
   const actionableKeys = new Set(actionable.map((candidate) => candidateKey(candidate)));
   const executionQueue = [...queueByKey.values()];
+  const executionMetadata = {
+    bootstrapMode,
+    executionHealthRegime: executionHealth.regime,
+    executionHealthPenalty: Number(executionHealth.markoutPenalty.toFixed(6)),
+  };
 
-  for (const candidate of executionQueue) {
+  for (const [index, candidate] of executionQueue.entries()) {
     const key = candidateKey(candidate);
     const isActionable = actionableKeys.has(key);
     if (!isActionable) {
@@ -4397,6 +4444,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
             : "Non-actionable candidate.";
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
         executionMessage: nonActionReason,
@@ -4407,6 +4455,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (!canExecuteLive) {
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
         executionMessage: input.execute
@@ -4421,6 +4470,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (!clusterGuard) {
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
         executionMessage: `Missing exchange hard-brake guard for cluster ${clusterKey}; live order blocked.`,
@@ -4430,6 +4480,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (clusterGuard.triggered) {
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
         executionMessage: `Exchange hard-brake active for cluster ${clusterKey} via order group ${clusterGuard.orderGroupId ?? "unassigned"}.`,
@@ -4439,6 +4490,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (!clusterGuard.orderGroupId) {
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
         executionMessage: `Cluster ${clusterKey} did not receive an order_group_id; live order blocked.`,
@@ -4447,32 +4499,57 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     }
 
     try {
-      await placeKalshiDemoOrder({
+      const clientOrderId = buildAutomationClientOrderId(runId, candidate, index);
+      const placement = await placeKalshiDemoOrder({
         ticker: candidate.ticker,
         side: candidate.side,
         count: candidate.recommendedContracts,
         limitPriceCents: candidate.limitPriceCents,
         contractStep: candidate.contractStep,
         orderGroupId: clusterGuard.orderGroupId,
+        clientOrderId,
       });
+      const placementRecord =
+        placement && typeof placement === "object" && "order" in placement && placement.order && typeof placement.order === "object"
+          ? (placement.order as Record<string, unknown>)
+          : (placement as Record<string, unknown>);
+      const executionOrderId = String(placementRecord.order_id ?? placementRecord.id ?? "").trim() || undefined;
+      const executionClientOrderId =
+        String(placementRecord.client_order_id ?? clientOrderId ?? "").trim() || clientOrderId;
 
       executedStake += candidate.recommendedStakeUsd;
 
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: false,
         executionStatus: "PLACED",
+        executionOrderId,
+        executionClientOrderId,
         executionMessage: `Order placed on Kalshi demo (${candidate.recommendedContracts} contracts, group ${clusterGuard.orderGroupId}).`,
       });
     } catch (error) {
+      const clientOrderId = buildAutomationClientOrderId(runId, candidate, index);
       executedCandidates.push({
         ...candidate,
+        ...executionMetadata,
         simulated: true,
         executionStatus: "FAILED",
+        executionClientOrderId: clientOrderId,
         executionMessage: (error as Error).message,
       });
     }
   }
+
+  await persistCandidateDecisions({
+    runId,
+    mode,
+    executeRequested: input.execute,
+    candidates: executedCandidates,
+    source: "automation/executed-candidates",
+  }).catch(() => {
+    warnings.push("Storage warning: failed to persist executed candidate decisions.");
+  });
 
   if (input.execute && !kalshi.connected) {
     warnings.push("Execute requested, but Kalshi trading credentials are missing; actions were simulated only.");

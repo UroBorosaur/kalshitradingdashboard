@@ -1,10 +1,14 @@
 import type {
   AutomationMode,
   CandidateVerdict,
+  CalibrationMethod,
+  ExecutionBootstrapMode,
+  ExecutionHealthRegime,
   ExecutionPlanRole,
   OpportunityType,
   PredictionCandidate,
   PredictionCategory,
+  ProbabilityTransform,
 } from "@/lib/prediction/types";
 
 export type PredictionStorageLayer = "raw" | "derived";
@@ -151,6 +155,13 @@ export interface StoredCandidateDecisionEvent {
   recommendedStakeUsd: number;
   recommendedContracts: number;
   limitPriceCents: number;
+  probabilityTransform?: ProbabilityTransform;
+  calibrationMethod?: CalibrationMethod;
+  expertWeights?: Array<{
+    expert: string;
+    weight: number;
+    probability: number;
+  }>;
   compositeScore?: number;
   portfolioWeight?: number;
   netAlphaUsd?: number;
@@ -160,6 +171,13 @@ export interface StoredCandidateDecisionEvent {
   uncertaintyWidth?: number;
   toxicityScore?: number;
   riskCluster?: string;
+  executionStatus?: "PLACED" | "SKIPPED" | "FAILED";
+  executionMessage?: string;
+  executionOrderId?: string;
+  executionClientOrderId?: string;
+  bootstrapMode?: ExecutionBootstrapMode;
+  executionHealthRegime?: ExecutionHealthRegime;
+  executionHealthPenalty?: number;
   strategyTags?: string[];
   executionPlan?: {
     limitPriceCents: number;
@@ -170,6 +188,7 @@ export interface StoredCandidateDecisionEvent {
     role: ExecutionPlanRole;
     quoteWidening?: number;
     staleHazard?: number;
+    inventorySkew?: number;
   };
   rationale: string[];
 }
@@ -250,6 +269,13 @@ export function toStoredCandidateDecisionPayload(
     recommendedStakeUsd: candidate.recommendedStakeUsd,
     recommendedContracts: candidate.recommendedContracts,
     limitPriceCents: candidate.limitPriceCents,
+    probabilityTransform: candidate.probabilityTransform,
+    calibrationMethod: candidate.calibrationMethod,
+    expertWeights: candidate.expertWeights?.map((row) => ({
+      expert: row.expert,
+      weight: row.weight,
+      probability: row.probability,
+    })),
     compositeScore: candidate.compositeScore,
     portfolioWeight: candidate.portfolioWeight,
     netAlphaUsd: candidate.netAlphaUsd,
@@ -259,8 +285,27 @@ export function toStoredCandidateDecisionPayload(
     uncertaintyWidth: candidate.uncertaintyWidth,
     toxicityScore: candidate.toxicityScore,
     riskCluster: candidate.riskCluster,
+    executionStatus: candidate.executionStatus,
+    executionMessage: candidate.executionMessage,
+    executionOrderId: candidate.executionOrderId,
+    executionClientOrderId: candidate.executionClientOrderId,
+    bootstrapMode: candidate.bootstrapMode,
+    executionHealthRegime: candidate.executionHealthRegime,
+    executionHealthPenalty: candidate.executionHealthPenalty,
     strategyTags: candidate.strategyTags,
-    executionPlan: candidate.executionPlan,
+    executionPlan: candidate.executionPlan
+      ? {
+          limitPriceCents: candidate.executionPlan.limitPriceCents,
+          patienceHours: candidate.executionPlan.patienceHours,
+          fillProbability: candidate.executionPlan.fillProbability,
+          expectedExecutionValueUsd: candidate.executionPlan.expectedExecutionValueUsd,
+          feeUsd: candidate.executionPlan.feeUsd,
+          role: candidate.executionPlan.role,
+          quoteWidening: candidate.executionPlan.quoteWidening,
+          staleHazard: candidate.executionPlan.staleHazard,
+          inventorySkew: candidate.executionPlan.inventorySkew,
+        }
+      : undefined,
     rationale: candidate.rationale,
   };
 }

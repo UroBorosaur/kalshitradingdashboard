@@ -155,6 +155,21 @@ const toggleControls: Array<{
   },
 ];
 
+function formatPercent(value: number | null | undefined, digits = 2) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  return `${(value * 100).toFixed(digits)}%`;
+}
+
+function formatUsd(value: number | null | undefined, digits = 2) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  return `$${value.toFixed(digits)}`;
+}
+
+function formatNumber(value: number | null | undefined, digits = 2) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  return value.toFixed(digits);
+}
+
 export function PredictionAutomationPanel() {
   const {
     mode,
@@ -172,8 +187,11 @@ export function PredictionAutomationPanel() {
     cadenceMinutes,
     setCadenceMinutes,
     summary,
+    attribution,
     loading,
+    attributionLoading,
     error,
+    attributionError,
     runCycle,
   } = usePredictionAutomation();
 
@@ -563,6 +581,98 @@ export function PredictionAutomationPanel() {
                 </p>
               </div>
             )}
+
+            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+              <p className="mb-2 flex items-center gap-1 text-[11px] font-semibold text-sky-200">
+                <Brain className="h-3.5 w-3.5" />
+                Execution Attribution
+              </p>
+
+              {attributionError ? (
+                <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-red-300">{attributionError}</div>
+              ) : attributionLoading && !attribution ? (
+                <div className="rounded-md border border-slate-800 bg-slate-950/60 p-3 text-slate-400">
+                  <Loader2 className="mb-1 h-4 w-4 animate-spin" />
+                  Loading recent execution attribution.
+                </div>
+              ) : attribution ? (
+                <div className="space-y-3">
+                  <div className="grid gap-2 text-[11px] text-slate-300 md:grid-cols-5">
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-slate-500">Decisions / Placed</p>
+                      <p className="font-semibold">
+                        {attribution.totals.decisions} / {attribution.totals.placed}
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-slate-500">Failed / Skipped</p>
+                      <p className="font-semibold">
+                        {attribution.totals.failed} / {attribution.totals.skipped}
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-slate-500">Avg Net Alpha</p>
+                      <p className="font-semibold">{formatUsd(attribution.totals.avgNetAlphaUsd)}</p>
+                    </div>
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-slate-500">30s / 2m Markout</p>
+                      <p className="font-semibold">
+                        {formatPercent(attribution.totals.avgMarkout30s)} / {formatPercent(attribution.totals.avgMarkout2m)}
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-slate-500">Expiry Markout</p>
+                      <p className="font-semibold">{formatPercent(attribution.totals.avgMarkoutExpiry)}</p>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                    {[
+                      { label: "By Expert", rows: attribution.byExpert },
+                      { label: "By Health Regime", rows: attribution.byExecutionHealth },
+                      { label: "By Cluster", rows: attribution.byCluster },
+                      { label: "By Uncertainty", rows: attribution.byUncertaintyWidth },
+                      { label: "By Toxicity", rows: attribution.byToxicity },
+                      { label: "By Bootstrap", rows: attribution.byBootstrap },
+                    ].map((group) => (
+                      <div key={group.label} className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                        <p className="text-[11px] text-slate-400">{group.label}</p>
+                        {group.rows.length ? (
+                          group.rows.map((row) => (
+                            <p key={`${group.label}-${row.key}`} className="mt-1 text-[11px] text-slate-300">
+                              {row.label} | {row.placed}/{row.decisions} placed | 30s {formatPercent(row.avgMarkout30s)} | expiry{" "}
+                              {formatPercent(row.avgMarkoutExpiry)}
+                            </p>
+                          ))
+                        ) : (
+                          <p className="mt-1 text-[11px] text-slate-500">No stored executions yet.</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                    <p className="text-[11px] text-slate-400">Recent Trade Forensics</p>
+                    {attribution.recentTrades.length ? (
+                      attribution.recentTrades.map((trade) => (
+                        <p key={`${trade.recordedAt}-${trade.ticker}-${trade.side}`} className="mt-1 text-[11px] text-slate-300">
+                          {trade.ticker} {trade.side} | {trade.executionStatus} | {trade.dominantExpert} | {trade.executionHealthRegime} |{" "}
+                          {trade.bootstrapMode} | edge {formatPercent(trade.edge)} | exec {formatPercent(trade.executionAdjustedEdge)} | 30s{" "}
+                          {formatPercent(trade.markout30s)} | expiry {formatPercent(trade.markoutExpiry)} | tox {formatPercent(trade.toxicityScore)} |{" "}
+                          uncert {formatPercent(trade.uncertaintyWidth)} | inv {formatNumber(trade.inventorySkew)}
+                        </p>
+                      ))
+                    ) : (
+                      <p className="mt-1 text-[11px] text-slate-500">No executed-candidate attribution has been stored yet.</p>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-md border border-slate-800 bg-slate-950/60 p-3 text-slate-400">
+                  No stored execution attribution yet.
+                </div>
+              )}
+            </div>
 
             {summary.portfolioRanking ? (
               <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">

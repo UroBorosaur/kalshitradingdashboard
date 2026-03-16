@@ -8,6 +8,8 @@ export type CandidateVerdict = "BUY_YES" | "BUY_NO" | "WATCHLIST" | "PASS";
 export type ExecutionPlanRole = "TAKER" | "MAKER" | "MAKER_FEE";
 export type ProbabilityTransform = "SIGMOID" | "SOFTMAX" | "SPARSEMAX" | "ENTMAX15";
 export type CalibrationMethod = "NONE" | "TEMPERATURE" | "ISOTONIC_STRUCTURAL";
+export type ExecutionBootstrapMode = "ACKED" | "EVENT_PRIMED" | "UNAVAILABLE";
+export type ExecutionHealthRegime = "NORMAL" | "TIGHTENED" | "DEFENSIVE";
 export type StrategyTag =
   | "FAVORITE_LONGSHOT_BIAS"
   | "SETTLEMENT_SPEC_ARBITRAGE"
@@ -116,6 +118,7 @@ export interface PredictionCandidate {
     role: ExecutionPlanRole;
     quoteWidening?: number;
     staleHazard?: number;
+    inventorySkew?: number;
   };
   rationale: string[];
   probabilityTransform?: ProbabilityTransform;
@@ -133,6 +136,11 @@ export interface PredictionCandidate {
   simulated: boolean;
   executionStatus?: "PLACED" | "SKIPPED" | "FAILED";
   executionMessage?: string;
+  executionOrderId?: string;
+  executionClientOrderId?: string;
+  bootstrapMode?: ExecutionBootstrapMode;
+  executionHealthRegime?: ExecutionHealthRegime;
+  executionHealthPenalty?: number;
 }
 
 export interface StrategicBreakdown {
@@ -243,6 +251,83 @@ export interface AutomationRunSummary {
   };
   controls?: AutomationControls;
   generatedAt: string;
+}
+
+export interface ExecutionAttributionBucket {
+  key: string;
+  label: string;
+  decisions: number;
+  placed: number;
+  failed: number;
+  skipped: number;
+  totalFilledContracts: number;
+  avgNetAlphaUsd: number | null;
+  avgExecutionAdjustedEdge: number | null;
+  avgMarkout30s: number | null;
+  avgMarkout2m: number | null;
+  avgMarkoutExpiry: number | null;
+}
+
+export interface ExecutionAttributionTrade {
+  recordedAt: string;
+  ticker: string;
+  title: string;
+  category: PredictionCategory;
+  side: PredictionSide;
+  executionStatus: "PLACED" | "SKIPPED" | "FAILED";
+  executionMessage: string;
+  dominantExpert: string;
+  dominantExpertWeight: number | null;
+  probabilityTransform?: ProbabilityTransform;
+  calibrationMethod?: CalibrationMethod;
+  cluster: string;
+  bootstrapMode: ExecutionBootstrapMode;
+  executionHealthRegime: ExecutionHealthRegime;
+  uncertaintyBucket: string;
+  toxicityBucket: string;
+  marketProb: number;
+  modelProb: number;
+  edge: number;
+  executionAdjustedEdge?: number | null;
+  netAlphaUsd?: number | null;
+  coherenceOverride?: number | null;
+  uncertaintyWidth?: number | null;
+  toxicityScore?: number | null;
+  inventorySkew?: number | null;
+  staleHazard?: number | null;
+  quoteWidening?: number | null;
+  limitPriceCents: number;
+  executionRole?: ExecutionPlanRole;
+  fillProbability?: number | null;
+  filledContracts: number;
+  averageFillPriceCents: number | null;
+  markout30s: number | null;
+  markout2m: number | null;
+  markoutExpiry: number | null;
+}
+
+export interface ExecutionAttributionSummary {
+  generatedAt: string;
+  lookbackHours: number;
+  totals: {
+    decisions: number;
+    placed: number;
+    failed: number;
+    skipped: number;
+    totalFilledContracts: number;
+    avgNetAlphaUsd: number | null;
+    avgExecutionAdjustedEdge: number | null;
+    avgMarkout30s: number | null;
+    avgMarkout2m: number | null;
+    avgMarkoutExpiry: number | null;
+  };
+  byExpert: ExecutionAttributionBucket[];
+  byExecutionHealth: ExecutionAttributionBucket[];
+  byCluster: ExecutionAttributionBucket[];
+  byUncertaintyWidth: ExecutionAttributionBucket[];
+  byToxicity: ExecutionAttributionBucket[];
+  byBootstrap: ExecutionAttributionBucket[];
+  recentTrades: ExecutionAttributionTrade[];
 }
 
 export interface AutomationControls {

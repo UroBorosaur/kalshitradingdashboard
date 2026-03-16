@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
   AutomationControls,
+  ExecutionAttributionSummary,
   AutomationMode,
   AutomationRunSummary,
   PredictionCategory,
@@ -21,6 +22,7 @@ const allCategories: PredictionCategory[] = [
 ];
 const baseCategories: PredictionCategory[] = [...allCategories];
 const AUTOMATION_CONTROLS_STORAGE_KEY = "prediction-automation-controls";
+const AUTOMATION_ATTRIBUTION_LOOKBACK_HOURS = 72;
 const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   edgeMultiplier: 1,
   confidenceShift: 0,
@@ -49,8 +51,36 @@ export function usePredictionAutomation() {
   const [controls, setControls] = useState<AutomationControls>(DEFAULT_AUTOMATION_CONTROLS);
 
   const [summary, setSummary] = useState<AutomationRunSummary | null>(null);
+  const [attribution, setAttribution] = useState<ExecutionAttributionSummary | null>(null);
   const [loading, setLoading] = useState(false);
+  const [attributionLoading, setAttributionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attributionError, setAttributionError] = useState<string | null>(null);
+
+  const fetchAttribution = useCallback(async () => {
+    setAttributionLoading(true);
+    setAttributionError(null);
+    try {
+      const response = await fetch(
+        `/api/automation/attribution?hours=${AUTOMATION_ATTRIBUTION_LOOKBACK_HOURS}&recentTradeLimit=12&bucketLimit=6`,
+      );
+      const json = (await response.json()) as {
+        ok: boolean;
+        attribution?: ExecutionAttributionSummary;
+        error?: string;
+      };
+
+      if (!response.ok || !json.ok || !json.attribution) {
+        throw new Error(json.error ?? "Attribution fetch failed");
+      }
+
+      setAttribution(json.attribution);
+    } catch (err) {
+      setAttributionError((err as Error).message);
+    } finally {
+      setAttributionLoading(false);
+    }
+  }, []);
 
   const runCycle = useCallback(
     async (override?: Partial<{ execute: boolean; mode: AutomationMode; categories: PredictionCategory[] }>) => {
@@ -82,13 +112,14 @@ export function usePredictionAutomation() {
         }
 
         setSummary(json.summary);
+        await fetchAttribution();
       } catch (err) {
         setError((err as Error).message);
       } finally {
         setLoading(false);
       }
     },
-    [categories, controls, execute, mode],
+    [categories, controls, execute, fetchAttribution, mode],
   );
 
   useEffect(() => {
@@ -105,6 +136,10 @@ export function usePredictionAutomation() {
   useEffect(() => {
     window.localStorage.setItem(AUTOMATION_CONTROLS_STORAGE_KEY, JSON.stringify(controls));
   }, [controls]);
+
+  useEffect(() => {
+    void fetchAttribution();
+  }, [fetchAttribution]);
 
   useEffect(() => {
     if (!autoLoop) return;
@@ -167,8 +202,12 @@ export function usePredictionAutomation() {
     cadenceMinutes,
     setCadenceMinutes,
     summary,
+    attribution,
     loading,
+    attributionLoading,
     error,
+    attributionError,
     runCycle,
+    fetchAttribution,
   };
 }
