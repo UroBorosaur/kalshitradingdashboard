@@ -20,6 +20,7 @@ import type {
   StoredResolutionEvent,
 } from "@/lib/storage/types";
 import type {
+  CandidateGateKey,
   ExecutionAttributionBucket,
   ExecutionCounterfactualBucket,
   ExecutionAttributionSummary,
@@ -36,6 +37,7 @@ const DEFAULT_RECENT_TRADE_LIMIT = 12;
 const DEFAULT_BUCKET_LIMIT = 6;
 const NEAR_MISS_SOURCE_PRIORITY = [
   "automation/executed-candidates",
+  "automation/conflict-blocked-candidates",
   "automation/planned-candidates",
   "automation/exploratory-boost",
   "automation/throughput-recovery-step-1",
@@ -172,6 +174,29 @@ function quoteMarkProbability(quote: StoredKalshiQuoteEvent, side: PredictionSid
 function sourcePriority(source: string) {
   const index = NEAR_MISS_SOURCE_PRIORITY.indexOf(source as (typeof NEAR_MISS_SOURCE_PRIORITY)[number]);
   return index === -1 ? NEAR_MISS_SOURCE_PRIORITY.length : index;
+}
+
+function gateLabel(gate: string) {
+  switch (gate) {
+    case "CONFIDENCE_FLOOR":
+      return "Confidence floor";
+    case "EXECUTION_EDGE":
+      return "Execution-adjusted edge";
+    case "TOXICITY":
+      return "Toxicity";
+    case "UNCERTAINTY_WIDTH":
+      return "Uncertainty width";
+    case "CLUSTER_CAP":
+      return "Cluster cap";
+    case "ORDER_GROUP_BRAKE":
+      return "Order-group brake";
+    case "POSITION_ORDER_CONFLICT":
+      return "Existing position/order conflict";
+    case "BOOTSTRAP_HEALTH":
+      return "Bootstrap / stream health";
+    default:
+      return gate;
+  }
 }
 
 function settlementMarkForDecision(
@@ -782,6 +807,10 @@ export function summarizeExecutionAttribution({
   const nearMissQuoteDrifts = nearMisses
     .map((event) => latestQuoteDriftForDecision({ decision: event, quotesByTicker }))
     .filter((value): value is number => value !== null);
+  const gateSummaryMap = new Map<
+    string,
+    { gate: string; label: string; unit: "probability" | "usd" | "count" | "severity"; count: number; missSum: number; missCount: number; maxMissBy: number }
+  >();
   const nearMissAvgEdge = average(
     nearMisses.reduce((sum, event) => sum + event.payload.edge, 0),
     nearMisses.length,
@@ -823,6 +852,25 @@ export function summarizeExecutionAttribution({
     .map((event) => {
       const dominantExpert = determineDominantExpert(event.payload.expertWeights);
       const latestQuoteDrift = latestQuoteDriftForDecision({ decision: event, quotesByTicker });
+      const failedGates = (event.payload.gateDiagnostics ?? []).filter((diagnostic) => !diagnostic.passed && diagnostic.missBy > 0);
+      for (const diagnostic of failedGates) {
+        const accumulator = gateSummaryMap.get(diagnostic.gate) ?? {
+          gate: diagnostic.gate,
+          label: gateLabel(diagnostic.gate),
+          unit: diagnostic.unit,
+          count: 0,
+          missSum: 0,
+          missCount: 0,
+          maxMissBy: 0,
+        };
+        accumulator.count += 1;
+        if (Number.isFinite(diagnostic.missBy)) {
+          accumulator.missSum += diagnostic.missBy;
+          accumulator.missCount += 1;
+          accumulator.maxMissBy = Math.max(accumulator.maxMissBy, diagnostic.missBy);
+        }
+        gateSummaryMap.set(diagnostic.gate, accumulator);
+      }
       const resolution = resolutionByTicker.get(event.payload.ticker)?.payload;
       const settlementMark = settlementMarkForDecision(resolution, event.payload.side);
       const counterfactualPnlUsd =
@@ -892,8 +940,22 @@ export function summarizeExecutionAttribution({
         counterfactualPnlUsd,
         expiryDrift,
         quoteToExpiryDivergence,
+        failedGates,
         executionMessage: event.payload.executionMessage,
       };
+    });
+  const byGate = [...gateSummaryMap.values()]
+    .map((row) => ({
+      gate: row.gate as CandidateGateKey,
+      label: row.label,
+      count: row.count,
+      unit: row.unit,
+      avgMissBy: average(row.missSum, row.missCount),
+      maxMissBy: row.missCount > 0 ? roundNullable(row.maxMissBy) : null,
+    }))
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return (b.avgMissBy ?? 0) - (a.avgMissBy ?? 0);
     });
 
   return {
@@ -949,6 +1011,7 @@ export function summarizeExecutionAttribution({
       falseNegativesByExpert: finalizeCounterfactualBuckets(falseNegativesByExpert, bucketLimit),
       falseNegativesByCluster: finalizeCounterfactualBuckets(falseNegativesByCluster, bucketLimit),
       falseNegativesByToxicity: finalizeCounterfactualBuckets(falseNegativesByToxicity, bucketLimit),
+      byGate,
       recentNearMisses,
     },
   };

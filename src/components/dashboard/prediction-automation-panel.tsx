@@ -170,6 +170,17 @@ function formatNumber(value: number | null | undefined, digits = 2) {
   return value.toFixed(digits);
 }
 
+function formatGateMiss(
+  value: number | null | undefined,
+  unit: "probability" | "usd" | "count" | "severity",
+) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  if (unit === "probability") return formatPercent(value);
+  if (unit === "usd") return formatUsd(value);
+  if (unit === "count") return value.toFixed(0);
+  return `${value.toFixed(0)} lvl`;
+}
+
 export function PredictionAutomationPanel() {
   const {
     mode,
@@ -750,6 +761,20 @@ export function PredictionAutomationPanel() {
                         </div>
 
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
+                          <p className="text-[11px] text-slate-400">Near-Miss Gates</p>
+                          {attribution.selectionControl.byGate.length ? (
+                            attribution.selectionControl.byGate.map((gate) => (
+                              <p key={gate.gate} className="mt-1 text-[11px] text-slate-300">
+                                {gate.label} | {gate.count} candidates | avg miss {formatGateMiss(gate.avgMissBy, gate.unit)} | max miss{" "}
+                                {formatGateMiss(gate.maxMissBy, gate.unit)}
+                              </p>
+                            ))
+                          ) : (
+                            <p className="mt-1 text-[11px] text-slate-500">No threshold gate failures recorded in this lookback window.</p>
+                          )}
+                        </div>
+
+                        <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">Recent Near Misses</p>
                           {attribution.selectionControl.recentNearMisses.length ? (
                             attribution.selectionControl.recentNearMisses.map((miss) => (
@@ -762,7 +787,13 @@ export function PredictionAutomationPanel() {
                                 {formatPercent(miss.executionAdjustedEdge)} | conf {formatPercent(miss.confidence)} | score{" "}
                                 {formatNumber(miss.compositeScore)} | drift {formatPercent(miss.latestQuoteDrift)} | resolved{" "}
                                 {miss.resolved ? (miss.realizedHit ? "HIT" : "MISS") : "pending"} | cf {formatUsd(miss.counterfactualPnlUsd)} | div{" "}
-                                {formatPercent(miss.quoteToExpiryDivergence)} | {miss.executionMessage ?? "No message"}
+                                {formatPercent(miss.quoteToExpiryDivergence)} | gates{" "}
+                                {miss.failedGates.length
+                                  ? miss.failedGates
+                                      .map((gate) => `${gate.gate}:${formatGateMiss(gate.missBy, gate.unit)}${gate.detail ? ` (${gate.detail})` : ""}`)
+                                      .join("; ")
+                                  : "none"}{" "}
+                                | {miss.executionMessage ?? "No message"}
                               </p>
                             ))
                           ) : (

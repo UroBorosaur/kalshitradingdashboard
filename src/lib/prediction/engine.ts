@@ -33,6 +33,7 @@ import {
 import type {
   AutomationControls,
   AutomationMode,
+  CandidateGateDiagnostic,
   ExecutionBootstrapMode,
   ExecutionHealthRegime,
   AutomationRunInput,
@@ -431,6 +432,17 @@ interface ExecutionHealthContext {
 
 const REQUIRED_PRIVATE_STREAM_CHANNELS = ["user_orders", "fill", "market_positions", "order_group_updates"] as const;
 
+function upsertGateDiagnostic(
+  diagnostics: CandidateGateDiagnostic[] | undefined,
+  nextDiagnostic: CandidateGateDiagnostic,
+): CandidateGateDiagnostic[] {
+  const next = [...(diagnostics ?? [])];
+  const index = next.findIndex((diagnostic) => diagnostic.gate === nextDiagnostic.gate);
+  if (index >= 0) next[index] = nextDiagnostic;
+  else next.push(nextDiagnostic);
+  return next;
+}
+
 function normalizeAutomationControls(input?: Partial<AutomationControls>): AutomationControls {
   return {
     edgeMultiplier: clamp(input?.edgeMultiplier ?? DEFAULT_AUTOMATION_CONTROLS.edgeMultiplier, 0.5, 1.8),
@@ -827,35 +839,98 @@ function buildOpenPositionConstraint(
 function filterExistingPositionCandidates(
   candidates: PredictionCandidate[],
   constraint: OpenPositionConstraint,
-): { filtered: PredictionCandidate[]; skipped: number; sameSideSkipped: number; orderSkipped: number } {
+): {
+  filtered: PredictionCandidate[];
+  blocked: PredictionCandidate[];
+  skipped: number;
+  sameSideSkipped: number;
+  orderSkipped: number;
+} {
   let skipped = 0;
   let sameSideSkipped = 0;
   let orderSkipped = 0;
+  const blocked: PredictionCandidate[] = [];
   const filtered = candidates.filter((candidate) => {
     const sameSideKey = `${candidate.ticker}:${candidate.side}`;
     if (constraint.sameSideKeys.has(sameSideKey)) {
       skipped += 1;
       sameSideSkipped += 1;
+      blocked.push({
+        ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
+          gate: "POSITION_ORDER_CONFLICT",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: "Same-side open exposure already exists.",
+        }),
+        executionStatus: "SKIPPED",
+        executionMessage: "Blocked by existing same-side position.",
+      });
       return false;
     }
     if (constraint.tickers.has(candidate.ticker)) {
       skipped += 1;
+      blocked.push({
+        ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
+          gate: "POSITION_ORDER_CONFLICT",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: "Market already has open exposure on another side.",
+        }),
+        executionStatus: "SKIPPED",
+        executionMessage: "Blocked by existing open position in the same market.",
+      });
       return false;
     }
     if (constraint.orderSideKeys.has(sameSideKey)) {
       skipped += 1;
       orderSkipped += 1;
+      blocked.push({
+        ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
+          gate: "POSITION_ORDER_CONFLICT",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: "Same-side order is already active or recently executed.",
+        }),
+        executionStatus: "SKIPPED",
+        executionMessage: "Blocked by existing same-side order.",
+      });
       return false;
     }
     if (constraint.orderTickers.has(candidate.ticker)) {
       skipped += 1;
       orderSkipped += 1;
+      blocked.push({
+        ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
+          gate: "POSITION_ORDER_CONFLICT",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: "Market already has an active or recent order.",
+        }),
+        executionStatus: "SKIPPED",
+        executionMessage: "Blocked by existing order in the same market.",
+      });
       return false;
     }
     return true;
   });
 
-  return { filtered, skipped, sameSideSkipped, orderSkipped };
+  return { filtered, blocked, skipped, sameSideSkipped, orderSkipped };
 }
 
 function marketYesReferenceProb(market: PredictionMarketQuote) {
@@ -3432,6 +3507,65 @@ function candidateFromMarket(
         })
       : undefined;
 
+  const gateDiagnostics: CandidateGateDiagnostic[] = [
+    {
+      gate: "CONFIDENCE_FLOOR",
+      passed: confidence >= confidenceRequired,
+      observed: Number(confidence.toFixed(6)),
+      threshold: Number(confidenceRequired.toFixed(6)),
+      missBy: Number(Math.max(0, confidenceRequired - confidence).toFixed(6)),
+      unit: "probability",
+      detail: isBtcMicro ? "BTC micro confidence floor" : "Primary confidence floor",
+    },
+    {
+      gate: "EXECUTION_EDGE",
+      passed: executionAdjustedEdge > 0,
+      observed: Number(executionAdjustedEdge.toFixed(6)),
+      threshold: 0,
+      missBy: Number(Math.max(0, -executionAdjustedEdge).toFixed(6)),
+      unit: "probability",
+      detail: "Execution-adjusted edge must remain positive after toxicity and uncertainty penalties.",
+    },
+    {
+      gate: "TOXICITY",
+      passed: executionAlpha.toxicityScore < 0.9,
+      observed: Number(executionAlpha.toxicityScore.toFixed(6)),
+      threshold: 0.9,
+      missBy: Number(Math.max(0, executionAlpha.toxicityScore - 0.9).toFixed(6)),
+      unit: "probability",
+      detail: "Actionable queue requires toxicity below 90%.",
+    },
+    {
+      gate: "UNCERTAINTY_WIDTH",
+      passed: !(rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice && uncertaintyWidth >= 0.08),
+      observed: Number(uncertaintyWidth.toFixed(6)),
+      threshold: 0.08,
+      missBy: Number(
+        (
+          rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice
+            ? Math.max(0, uncertaintyWidth - 0.08)
+            : 0
+        ).toFixed(6),
+      ),
+      unit: "probability",
+      detail:
+        rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice
+          ? "Robust fair-value interval straddles execution price."
+          : "Rulebook interval does not straddle execution price.",
+    },
+    {
+      gate: "BOOTSTRAP_HEALTH",
+      passed: executionHealth.regime === "NORMAL",
+      observed:
+        executionHealth.regime === "DEFENSIVE" ? 2 : executionHealth.regime === "TIGHTENED" ? 1 : 0,
+      threshold: 0,
+      missBy:
+        executionHealth.regime === "DEFENSIVE" ? 2 : executionHealth.regime === "TIGHTENED" ? 1 : 0,
+      unit: "severity",
+      detail: `Execution-health regime ${executionHealth.regime}.`,
+    },
+  ];
+
   return {
     ticker: market.ticker,
     title: market.title,
@@ -3476,6 +3610,7 @@ function candidateFromMarket(
       staleHazard: Number(executionAlpha.staleHazard.toFixed(6)),
       inventorySkew: Number(executionAlpha.inventorySkew.toFixed(6)),
     },
+    gateDiagnostics,
     rationale,
     probabilityTransform: probabilityEstimate.probabilityTransform,
     calibrationMethod: probabilityEstimate.calibrationMethod,
@@ -3700,6 +3835,7 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
   }
 
   const targetStakeByKey = new Map<string, number>();
+  const clusterCapMissByKey = new Map<string, number>();
   for (const { candidate } of tradable) {
     const key = candidateKey(candidate);
     const weight = rawWeightSum > 0 ? (rawWeightByKey.get(key) ?? 0) / rawWeightSum : 0;
@@ -3722,7 +3858,13 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
     const clusterKey = candidate.riskCluster ?? candidate.category;
     const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
     if (unitStake > riskRemaining) continue;
-    if (clusterStake + unitStake > clusterStakeLimitUsd) continue;
+    if (clusterStake + unitStake > clusterStakeLimitUsd) {
+      clusterCapMissByKey.set(
+        candidateKey(candidate),
+        Math.max(clusterCapMissByKey.get(candidateKey(candidate)) ?? 0, clusterStake + unitStake - clusterStakeLimitUsd),
+      );
+      continue;
+    }
     const targetStake = targetStakeByKey.get(candidateKey(candidate)) ?? 0;
     const strongSignal =
       (candidate.compositeScore ?? 0) > SCORE_THRESHOLD_BY_MODE[mode] * 1.35 ||
@@ -3769,7 +3911,13 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
       const clusterKey = candidate.riskCluster ?? candidate.category;
       const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
       if (unitStake > riskRemaining) continue;
-      if (clusterStake + unitStake > clusterStakeLimitUsd) continue;
+      if (clusterStake + unitStake > clusterStakeLimitUsd) {
+        clusterCapMissByKey.set(
+          candidateKey(candidate),
+          Math.max(clusterCapMissByKey.get(key) ?? 0, clusterStake + unitStake - clusterStakeLimitUsd),
+        );
+        continue;
+      }
 
       const currentContracts = allocatedContracts.get(key) ?? 0;
       const currentStake = currentContracts * price;
@@ -3837,6 +3985,18 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
             feeUsd: Number((((candidate.executionPlan.feeUsd / executionBaseContracts) || 0) * contracts).toFixed(4)),
           }
         : undefined,
+      gateDiagnostics:
+        contracts <= 0 && clusterCapMissByKey.has(candidateKey(candidate))
+          ? upsertGateDiagnostic(candidate.gateDiagnostics, {
+              gate: "CLUSTER_CAP",
+              passed: false,
+              observed: Number(((clusterCapMissByKey.get(candidateKey(candidate)) ?? 0) + clusterStakeLimitUsd).toFixed(6)),
+              threshold: Number(clusterStakeLimitUsd.toFixed(6)),
+              missBy: Number((clusterCapMissByKey.get(candidateKey(candidate)) ?? 0).toFixed(6)),
+              unit: "usd",
+              detail: `Cluster stake cap blocked additional allocation in ${candidate.riskCluster ?? candidate.category}.`,
+            })
+          : candidate.gateDiagnostics,
     };
   }
 
@@ -4177,6 +4337,17 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     .filter((candidate): candidate is PredictionCandidate => candidate !== null);
   const generatedFilter = filterExistingPositionCandidates(generatedRaw, openPositionConstraint);
   const generated = generatedFilter.filtered;
+  if (generatedFilter.blocked.length) {
+    await persistCandidateDecisions({
+      runId,
+      mode,
+      executeRequested: input.execute,
+      candidates: generatedFilter.blocked,
+      source: "automation/conflict-blocked-candidates",
+    }).catch(() => {
+      warnings.push("Storage warning: failed to persist conflict-blocked candidate decisions.");
+    });
+  }
   await persistCandidateDecisions({
     runId,
     mode,
@@ -4438,6 +4609,28 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     executionHealthPenalty: Number(executionHealth.markoutPenalty.toFixed(6)),
   };
 
+  function withRuntimeGateDiagnostics(candidate: PredictionCandidate): CandidateGateDiagnostic[] {
+    return upsertGateDiagnostic(candidate.gateDiagnostics, {
+      gate: "BOOTSTRAP_HEALTH",
+      passed: bootstrapMode === "ACKED" && executionHealth.regime === "NORMAL",
+      observed:
+        bootstrapMode === "UNAVAILABLE"
+          ? 2
+          : bootstrapMode === "EVENT_PRIMED" || executionHealth.regime !== "NORMAL"
+            ? 1
+            : 0,
+      threshold: 0,
+      missBy:
+        bootstrapMode === "UNAVAILABLE"
+          ? 2
+          : bootstrapMode === "EVENT_PRIMED" || executionHealth.regime !== "NORMAL"
+            ? 1
+            : 0,
+      unit: "severity",
+      detail: `Bootstrap ${bootstrapMode}; execution-health regime ${executionHealth.regime}.`,
+    });
+  }
+
   for (const [index, candidate] of executionQueue.entries()) {
     const key = candidateKey(candidate);
     const isActionable = actionableKeys.has(key);
@@ -4453,6 +4646,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
             : "Non-actionable candidate.";
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
         ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
@@ -4464,6 +4658,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (!canExecuteLive) {
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
         ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
@@ -4479,6 +4674,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (!clusterGuard) {
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(candidate), {
+          gate: "ORDER_GROUP_BRAKE",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: `Missing exchange hard-brake guard for cluster ${clusterKey}.`,
+        }),
         ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
@@ -4489,6 +4693,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (clusterGuard.triggered) {
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(candidate), {
+          gate: "ORDER_GROUP_BRAKE",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: `Order group ${clusterGuard.orderGroupId ?? "unassigned"} is triggered for cluster ${clusterKey}.`,
+        }),
         ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
@@ -4499,6 +4712,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     if (!clusterGuard.orderGroupId) {
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(candidate), {
+          gate: "ORDER_GROUP_BRAKE",
+          passed: false,
+          observed: 1,
+          threshold: 0,
+          missBy: 1,
+          unit: "count",
+          detail: `Cluster ${clusterKey} did not receive an order_group_id.`,
+        }),
         ...executionMetadata,
         simulated: true,
         executionStatus: "SKIPPED",
@@ -4530,6 +4752,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
 
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
         ...executionMetadata,
         simulated: false,
         executionStatus: "PLACED",
@@ -4541,6 +4764,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       const clientOrderId = buildAutomationClientOrderId(runId, candidate, index);
       executedCandidates.push({
         ...candidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
         ...executionMetadata,
         simulated: true,
         executionStatus: "FAILED",

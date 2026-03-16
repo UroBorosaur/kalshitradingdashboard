@@ -159,6 +159,17 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
         expertWeights: [{ expert: "MICROSTRUCTURE", weight: 0.55, probability: 0.5 }],
         compositeScore: 0.009,
         riskCluster: "CRYPTO:MISS",
+        gateDiagnostics: [
+          {
+            gate: "POSITION_ORDER_CONFLICT",
+            passed: false,
+            observed: 1,
+            threshold: 0,
+            missBy: 1,
+            unit: "count",
+            detail: "Market already has an active or recent order.",
+          },
+        ],
         executionStatus: "SKIPPED",
         executionMessage: "Skipped after portfolio sizing.",
         rationale: [],
@@ -367,9 +378,12 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.selectionControl?.recentNearMisses[0]?.resolved, true);
   assert.equal(summary.selectionControl?.recentNearMisses[0]?.realizedHit, true);
   assert.equal(summary.selectionControl?.recentNearMisses[0]?.counterfactualPnlUsd, 2.9);
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.failedGates[0]?.gate, "POSITION_ORDER_CONFLICT");
   assert.equal(summary.selectionControl?.resolvedNearMisses.count, 1);
   assert.equal(summary.selectionControl?.resolvedNearMisses.hitRate, 1);
   assert.equal(summary.selectionControl?.resolvedNearMisses.profitableRate, 1);
   assert.equal(summary.selectionControl?.resolvedNearMisses.totalCounterfactualPnlUsd, 2.9);
   assert.equal(summary.selectionControl?.falseNegativesByExpert[0]?.key, "MICROSTRUCTURE");
+  assert.equal(summary.selectionControl?.byGate[0]?.gate, "POSITION_ORDER_CONFLICT");
+  assert.equal(summary.selectionControl?.byGate[0]?.avgMissBy, 1);
 });

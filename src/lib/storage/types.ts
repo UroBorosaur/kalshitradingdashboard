@@ -1,6 +1,7 @@
 import type {
   AutomationMode,
   CandidateVerdict,
+  CandidateGateDiagnostic,
   CalibrationMethod,
   ExecutionBootstrapMode,
   ExecutionHealthRegime,
@@ -197,6 +198,7 @@ export interface StoredCandidateDecisionEvent {
     staleHazard?: number;
     inventorySkew?: number;
   };
+  gateDiagnostics?: CandidateGateDiagnostic[];
   rationale: string[];
 }
 
@@ -314,7 +316,16 @@ export function toStoredCandidateDecisionPayload(
           staleHazard: candidate.executionPlan.staleHazard,
           inventorySkew: candidate.executionPlan.inventorySkew,
         }
-      : undefined,
+        : undefined,
+    gateDiagnostics: candidate.gateDiagnostics?.map((diagnostic) => ({
+      gate: diagnostic.gate,
+      passed: diagnostic.passed,
+      observed: diagnostic.observed,
+      threshold: diagnostic.threshold,
+      missBy: diagnostic.missBy,
+      unit: diagnostic.unit,
+      detail: diagnostic.detail,
+    })),
     rationale: candidate.rationale,
   };
 }

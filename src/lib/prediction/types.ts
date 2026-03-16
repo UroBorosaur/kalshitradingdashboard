@@ -10,6 +10,15 @@ export type ProbabilityTransform = "SIGMOID" | "SOFTMAX" | "SPARSEMAX" | "ENTMAX
 export type CalibrationMethod = "NONE" | "TEMPERATURE" | "ISOTONIC_STRUCTURAL";
 export type ExecutionBootstrapMode = "ACKED" | "EVENT_PRIMED" | "UNAVAILABLE";
 export type ExecutionHealthRegime = "NORMAL" | "TIGHTENED" | "DEFENSIVE";
+export type CandidateGateKey =
+  | "CONFIDENCE_FLOOR"
+  | "EXECUTION_EDGE"
+  | "TOXICITY"
+  | "UNCERTAINTY_WIDTH"
+  | "CLUSTER_CAP"
+  | "ORDER_GROUP_BRAKE"
+  | "POSITION_ORDER_CONFLICT"
+  | "BOOTSTRAP_HEALTH";
 export type StrategyTag =
   | "FAVORITE_LONGSHOT_BIAS"
   | "SETTLEMENT_SPEC_ARBITRAGE"
@@ -36,6 +45,16 @@ export type StrategyTag =
   | "ENTMAX_STRUCTURAL"
   | "MIXTURE_OF_EXPERTS"
   | "TEMPERATURE_CALIBRATED";
+
+export interface CandidateGateDiagnostic {
+  gate: CandidateGateKey;
+  passed: boolean;
+  observed: number | null;
+  threshold: number | null;
+  missBy: number;
+  unit: "probability" | "usd" | "count" | "severity";
+  detail?: string;
+}
 
 export interface PredictionMarketQuote {
   ticker: string;
@@ -120,6 +139,7 @@ export interface PredictionCandidate {
     staleHazard?: number;
     inventorySkew?: number;
   };
+  gateDiagnostics?: CandidateGateDiagnostic[];
   rationale: string[];
   probabilityTransform?: ProbabilityTransform;
   calibrationMethod?: CalibrationMethod;
@@ -279,6 +299,15 @@ export interface ExecutionCounterfactualBucket {
   totalCounterfactualPnlUsd: number | null;
 }
 
+export interface SelectionGateSummary {
+  gate: CandidateGateKey;
+  label: string;
+  count: number;
+  unit: "probability" | "usd" | "count" | "severity";
+  avgMissBy: number | null;
+  maxMissBy: number | null;
+}
+
 export interface ExecutionAttributionTrade {
   recordedAt: string;
   ticker: string;
@@ -381,6 +410,7 @@ export interface ExecutionAttributionSummary {
     falseNegativesByExpert: ExecutionCounterfactualBucket[];
     falseNegativesByCluster: ExecutionCounterfactualBucket[];
     falseNegativesByToxicity: ExecutionCounterfactualBucket[];
+    byGate: SelectionGateSummary[];
     recentNearMisses: Array<{
       recordedAt: string;
       ticker: string;
@@ -402,6 +432,7 @@ export interface ExecutionAttributionSummary {
       counterfactualPnlUsd: number | null;
       expiryDrift: number | null;
       quoteToExpiryDivergence: number | null;
+      failedGates: CandidateGateDiagnostic[];
       executionMessage?: string;
     }>;
   };
