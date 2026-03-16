@@ -13,6 +13,8 @@ export interface KalshiStreamStatus {
   primedPrivate: boolean;
   lastMessageAt: string | null;
   lastHeartbeatAt: string | null;
+  lastControlPingAt: string | null;
+  lastControlPongAt: string | null;
   lastResyncAt: string | null;
   reconnectCount: number;
   desyncCount: number;

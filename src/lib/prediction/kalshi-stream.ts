@@ -4,6 +4,14 @@ import WebSocket from "ws";
 
 import type { KalshiStreamStatus } from "@/lib/live/types";
 import {
+  normalizeKalshiPriceRanges,
+  normalizeKalshiTickSizeCents,
+  parseKalshiContractCount,
+  parseKalshiNumber,
+  parseKalshiProbability,
+  probabilityToCents,
+} from "@/lib/prediction/fixed-point";
+import {
   getKalshiDemoBalancesUsd,
   getKalshiDemoFills,
   getKalshiDemoOrders,
@@ -73,29 +81,15 @@ interface StreamSummarySnapshot extends StreamPrivateStateSnapshot {
 }
 
 function toNumber(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
-    const cleaned = value.replace(/[$,%\s,]/g, "");
-    const cleanedParsed = Number(cleaned);
-    if (Number.isFinite(cleanedParsed)) return cleanedParsed;
-  }
-  return null;
+  return parseKalshiNumber(value);
 }
 
 function toProbability(value: unknown): number | null {
-  const raw = toNumber(value);
-  if (raw === null) return null;
-  const normalized = raw > 1 ? raw / 100 : raw;
-  if (!Number.isFinite(normalized) || normalized < 0 || normalized > 1) return null;
-  return Number(normalized.toFixed(4));
+  return parseKalshiProbability(value);
 }
 
 function toContractCount(value: unknown): number | null {
-  const parsed = toNumber(value);
-  if (parsed === null || !Number.isFinite(parsed) || parsed < 0) return null;
-  return Number(parsed.toFixed(6));
+  return parseKalshiContractCount(value);
 }
 
 function toSignedContractCount(value: unknown): number | null {
@@ -198,6 +192,8 @@ class KalshiStreamService {
   private lastResyncAtMs = 0;
   private lastMessageAtMs = 0;
   private lastHeartbeatAtMs = 0;
+  private lastControlPingAtMs = 0;
+  private lastControlPongAtMs = 0;
   private lastError: string | null = null;
   private publicPrimedAtMs = 0;
   private privatePrimedAtMs = 0;
@@ -447,6 +443,17 @@ class KalshiStreamService {
       lastPrice: firstDefinedProb(message.price_dollars, message.last_price_dollars, message.last_price),
       volume: firstDefinedNumber(toNumber(message.volume_fp), toNumber(message.volume), undefined) ?? undefined,
       openInterest: firstDefinedNumber(toNumber(message.open_interest_fp), toNumber(message.open_interest), undefined) ?? undefined,
+      tickSize: message.tick_size !== undefined || message.tick_size_dollars !== undefined
+        ? normalizeKalshiTickSizeCents(message.tick_size_dollars ?? message.tick_size)
+        : undefined,
+      priceLevelStructure: typeof message.price_level_structure === "string" ? message.price_level_structure : undefined,
+      priceRanges: normalizeKalshiPriceRanges(message.price_ranges),
+      fractionalTradingEnabled:
+        message.fractional_trading_enabled === true
+          ? true
+          : message.fractional_trading_enabled === false
+            ? false
+            : undefined,
     });
   }
 
@@ -558,10 +565,10 @@ class KalshiStreamService {
       action: typeof message.action === "string" ? message.action : "buy",
       status: typeof message.status === "string" ? message.status : String(message.type ?? "open"),
       type: typeof message.order_type === "string" ? message.order_type : (typeof message.type === "string" ? message.type : undefined),
-      count: firstDefinedCount(message.count, message.count_fp, message.initial_count, message.initial_count_fp, message.quantity) ?? 0,
+      count: firstDefinedCount(message.count_fp, message.count, message.initial_count_fp, message.initial_count, message.quantity) ?? 0,
       remaining_count: firstDefinedCount(message.remaining_count, message.remaining_count_fp, message.remaining_quantity),
-      yes_price: typeof yesPrice === "number" ? Math.round(yesPrice <= 1 ? yesPrice * 100 : yesPrice) : undefined,
-      no_price: typeof noPrice === "number" ? Math.round(noPrice <= 1 ? noPrice * 100 : noPrice) : undefined,
+      yes_price: typeof yesPrice === "number" ? probabilityToCents(yesPrice <= 1 ? yesPrice : yesPrice / 100) : undefined,
+      no_price: typeof noPrice === "number" ? probabilityToCents(noPrice <= 1 ? noPrice : noPrice / 100) : undefined,
       created_time: toIsoTime(message.created_time ?? message.ts),
       expiration_time: toIsoTime(message.expiration_time),
       last_update_time: toIsoTime(message.updated_time ?? message.ts),
@@ -589,9 +596,9 @@ class KalshiStreamService {
       ticker,
       side,
       action: typeof message.action === "string" ? message.action : "buy",
-      count: firstDefinedCount(message.count, message.count_fp, message.quantity, message.fill_count, message.fill_count_fp) ?? 0,
-      yes_price: typeof yesPrice === "number" ? Math.round(yesPrice <= 1 ? yesPrice * 100 : yesPrice) : undefined,
-      no_price: typeof noPrice === "number" ? Math.round(noPrice <= 1 ? noPrice * 100 : noPrice) : undefined,
+      count: firstDefinedCount(message.count_fp, message.count, message.quantity, message.fill_count_fp, message.fill_count) ?? 0,
+      yes_price: typeof yesPrice === "number" ? probabilityToCents(yesPrice <= 1 ? yesPrice : yesPrice / 100) : undefined,
+      no_price: typeof noPrice === "number" ? probabilityToCents(noPrice <= 1 ? noPrice : noPrice / 100) : undefined,
       created_time: toIsoTime(message.created_time ?? message.ts),
     });
   }
@@ -618,6 +625,19 @@ class KalshiStreamService {
   private handleMessage(raw: Record<string, unknown>) {
     const type = String(raw.type ?? "").toLowerCase();
     const id = toNumber(raw.id);
+    const nestedPayload =
+      raw.msg && typeof raw.msg === "object" && !Array.isArray(raw.msg)
+        ? (raw.msg as Record<string, unknown>)
+        : null;
+    const payload = nestedPayload
+      ? {
+          ...nestedPayload,
+          sid: raw.sid ?? nestedPayload.sid,
+          seq: raw.seq ?? nestedPayload.seq,
+          channel: raw.channel ?? nestedPayload.channel,
+          market_tickers: raw.market_tickers ?? nestedPayload.market_tickers,
+        }
+      : raw;
     this.setLastMessageNow();
 
     if (id !== null && (type === "subscribed" || type === "updated_subscription" || type === "ok" || type === "list_subscriptions")) {
@@ -648,22 +668,22 @@ class KalshiStreamService {
 
     switch (type) {
       case "ticker":
-        this.applyTickerMessage(raw);
+        this.applyTickerMessage(payload);
         return;
       case "orderbook_snapshot":
-        this.applyOrderbookSnapshot(raw);
+        this.applyOrderbookSnapshot(payload);
         return;
       case "orderbook_delta":
-        this.applyOrderbookDelta(raw);
+        this.applyOrderbookDelta(payload);
         return;
       case "user_order":
-        this.applyUserOrderMessage(raw);
+        this.applyUserOrderMessage(payload);
         return;
       case "fill":
-        this.applyFillMessage(raw);
+        this.applyFillMessage(payload);
         return;
       case "market_position":
-        this.applyPositionMessage(raw);
+        this.applyPositionMessage(payload);
         return;
       default:
         return;
@@ -766,6 +786,12 @@ class KalshiStreamService {
       socket.on("message", (data) => {
         const parsed = this.parseJson(data);
         if (parsed) this.handleMessage(parsed);
+      });
+      socket.on("ping", () => {
+        this.lastControlPingAtMs = Date.now();
+      });
+      socket.on("pong", () => {
+        this.lastControlPongAtMs = Date.now();
       });
       socket.on("error", (error) => {
         clearTimeout(timeout);
@@ -969,6 +995,8 @@ class KalshiStreamService {
       primedPrivate: this.privatePrimedAtMs > 0,
       lastMessageAt: this.lastMessageAtMs ? new Date(this.lastMessageAtMs).toISOString() : null,
       lastHeartbeatAt: this.lastHeartbeatAtMs ? new Date(this.lastHeartbeatAtMs).toISOString() : null,
+      lastControlPingAt: this.lastControlPingAtMs ? new Date(this.lastControlPingAtMs).toISOString() : null,
+      lastControlPongAt: this.lastControlPongAtMs ? new Date(this.lastControlPongAtMs).toISOString() : null,
       lastResyncAt: this.lastResyncAtMs ? new Date(this.lastResyncAtMs).toISOString() : null,
       reconnectCount: this.reconnectCount,
       desyncCount: this.desyncCount,

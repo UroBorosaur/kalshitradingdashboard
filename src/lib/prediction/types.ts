@@ -57,6 +57,13 @@ export interface PredictionMarketQuote {
   openInterest: number;
   liquidityDollars: number;
   tickSize: number;
+  priceLevelStructure?: string;
+  priceRanges?: Array<{
+    minProbability: number;
+    maxProbability: number;
+    tickSizeCents: number;
+  }>;
+  fractionalTradingEnabled?: boolean;
   settlementTimerSeconds: number;
   rulesPrimary?: string;
   rulesSecondary?: string;
@@ -82,6 +89,7 @@ export interface PredictionCandidate {
   confidence: number;
   recommendedStakeUsd: number;
   recommendedContracts: number;
+  contractStep?: number;
   limitPriceCents: number;
   rulebookProb?: number;
   rulebookProbLower?: number;
@@ -261,6 +269,7 @@ export interface KalshiOrderRequest {
   side: PredictionSide;
   count: number;
   limitPriceCents: number;
+  contractStep?: number;
   clientOrderId?: string;
 }
 

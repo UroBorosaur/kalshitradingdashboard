@@ -3,6 +3,18 @@ import "server-only";
 import crypto from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
+import {
+  formatKalshiCountFp,
+  formatKalshiPriceDollars,
+  normalizeKalshiPriceRanges,
+  normalizeKalshiTickSizeCents,
+  parseKalshiContractCount,
+  parseKalshiMoneyUsd,
+  parseKalshiNumber,
+  parseKalshiProbability,
+  probabilityToCents,
+  snapContractCount,
+} from "@/lib/prediction/fixed-point";
 import type {
   KalshiFillLite,
   KalshiOrderLite,
@@ -82,23 +94,11 @@ function hasTradingCredentials() {
 }
 
 function toNumber(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const num = Number(value);
-    if (Number.isFinite(num)) return num;
-
-    const cleaned = value.replace(/[$,%\s,]/g, "");
-    const cleanedNum = Number(cleaned);
-    if (Number.isFinite(cleanedNum)) return cleanedNum;
-  }
-  return null;
+  return parseKalshiNumber(value);
 }
 
 function toContractCount(value: unknown): number | null {
-  const parsed = toNumber(value);
-  if (parsed === null || !Number.isFinite(parsed)) return null;
-  if (parsed < 0) return null;
-  return Number(parsed.toFixed(6));
+  return parseKalshiContractCount(value);
 }
 
 function firstDefinedCents(...values: unknown[]): number | undefined {
@@ -125,29 +125,19 @@ function firstDefinedNumber(...values: Array<number | null | undefined>): number
 }
 
 function toProbability(value: unknown): number | null {
-  const raw = toNumber(value);
-  if (raw === null) return null;
-
-  const normalized = raw > 1 ? raw / 100 : raw;
-  if (!Number.isFinite(normalized)) return null;
-  if (normalized < 0 || normalized > 1) return null;
-  return Number(normalized.toFixed(4));
+  return parseKalshiProbability(value);
 }
 
 function toCents(value: unknown): number | undefined {
   const raw = toNumber(value);
   if (raw === null) return undefined;
-  return Math.round(raw <= 1 ? raw * 100 : raw);
+  return probabilityToCents(raw <= 1 ? raw : raw / 100);
 }
 
 function toFiniteString(value: unknown): string | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return String(value);
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return undefined;
-    const parsed = Number(trimmed);
-    if (Number.isFinite(parsed)) return trimmed;
-  }
+  const parsedMoney = parseKalshiMoneyUsd(value);
+  if (parsedMoney !== null) return String(parsedMoney);
+  if (typeof value === "string" && value.trim()) return value.trim();
   return undefined;
 }
 
@@ -219,7 +209,7 @@ function mapMarket(raw: Record<string, unknown>): PredictionMarketQuote | null {
   const volume = Math.max(0, toNumber(raw.volume_fp) ?? toNumber(raw.volume_24h_fp) ?? toNumber(raw.volume) ?? 0);
   const openInterest = Math.max(0, toNumber(raw.open_interest_fp) ?? toNumber(raw.open_interest) ?? 0);
   const liquidityDollars = Math.max(0, toNumber(raw.liquidity_dollars) ?? 0);
-  const tickSize = Math.max(1, Math.round(toNumber(raw.tick_size) ?? 1));
+  const tickSize = normalizeKalshiTickSizeCents(raw.tick_size_dollars ?? raw.tick_size ?? raw.min_tick_size);
   const settlementTimerSeconds = Math.max(0, Math.round(toNumber(raw.settlement_timer_seconds) ?? 0));
   const floorStrike = toNumber(raw.floor_strike);
   const notionalValue = Math.max(0, toNumber(raw.notional_value_dollars) ?? 1);
@@ -246,6 +236,9 @@ function mapMarket(raw: Record<string, unknown>): PredictionMarketQuote | null {
     openInterest,
     liquidityDollars,
     tickSize,
+    priceLevelStructure: raw.price_level_structure ? String(raw.price_level_structure) : undefined,
+    priceRanges: normalizeKalshiPriceRanges(raw.price_ranges),
+    fractionalTradingEnabled: raw.fractional_trading_enabled === true,
     settlementTimerSeconds,
     rulesPrimary: raw.rules_primary ? String(raw.rules_primary) : undefined,
     rulesSecondary: raw.rules_secondary ? String(raw.rules_secondary) : undefined,
@@ -447,7 +440,7 @@ function sanitizeClientOrderId(raw: string | undefined): string {
 }
 
 function clampPriceCents(raw: number) {
-  return Math.min(99, Math.max(1, Math.round(raw)));
+  return Number(Math.min(99.9999, Math.max(0.0001, raw)).toFixed(4));
 }
 
 interface KalshiBalanceSnapshot {
@@ -495,7 +488,13 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
   if (!ticker) throw new Error("Kalshi order rejected locally: ticker is required.");
 
   const side = order.side === "NO" ? "no" : "yes";
-  const count = Math.max(1, Math.floor(Number(order.count) || 0));
+  const requestedCount = Number(Number(order.count) || 0);
+  const requestedStep = Number(order.contractStep ?? 0);
+  const contractStep = Math.max(
+    0.01,
+    Number.isFinite(requestedStep) && requestedStep > 0 ? requestedStep : requestedCount < 1 ? 0.01 : 1,
+  );
+  const count = Math.max(contractStep, snapContractCount(requestedCount, contractStep, "down"));
   const primaryPrice = clampPriceCents(Number(order.limitPriceCents));
   const clientOrderId = sanitizeClientOrderId(order.clientOrderId);
 
@@ -505,11 +504,18 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
       action: "buy",
       side,
       type: "limit",
-      count,
+      count_fp: formatKalshiCountFp(count),
     };
+    if (Number.isInteger(count)) body.count = Math.max(1, Math.floor(count));
     if (includeClientOrderId) body.client_order_id = clientOrderId;
-    if (side === "yes") body.yes_price = priceCents;
-    else body.no_price = priceCents;
+    const priceDollars = formatKalshiPriceDollars(priceCents / 100);
+    if (side === "yes") {
+      body.yes_price_dollars = priceDollars;
+      if (Math.abs(priceCents - Math.round(priceCents)) < 1e-9) body.yes_price = Math.round(priceCents);
+    } else {
+      body.no_price_dollars = priceDollars;
+      if (Math.abs(priceCents - Math.round(priceCents)) < 1e-9) body.no_price = Math.round(priceCents);
+    }
     return body;
   }
 
@@ -520,14 +526,19 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
         method: "POST",
         body: JSON.stringify({
           ...buildBody(priceCents, includeClientOrderId),
-          count: Math.max(1, Math.floor(contractCount)),
+          count_fp: formatKalshiCountFp(contractCount),
+          ...(Math.abs(contractCount - Math.round(contractCount)) < 1e-9
+            ? { count: Math.max(1, Math.floor(contractCount)) }
+            : {}),
         }),
       },
       true,
     );
   }
 
-  const countsToTry = [...new Set([count, 1])];
+  const countsToTry = [...new Set([count, Number(snapContractCount(contractStep, contractStep, "down").toFixed(6))])]
+    .filter((contractCount) => Number.isFinite(contractCount) && contractCount >= contractStep)
+    .sort((a, b) => b - a);
   const attempts: Array<{ priceCents: number; includeClientOrderId: boolean; contractCount: number }> = [];
   for (const contractCount of countsToTry) {
     attempts.push({ priceCents: primaryPrice, includeClientOrderId: true, contractCount });
@@ -573,7 +584,7 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
     // Ignore quote fetch errors and rethrow original order failure below.
   }
 
-  const context = `ticker=${ticker} side=${side} count=${count} price=${primaryPrice}`;
+  const context = `ticker=${ticker} side=${side} count=${count} step=${contractStep} price=${primaryPrice}`;
   if (lastError) {
     throw new Error(`${lastError.message} | ${context}`);
   }

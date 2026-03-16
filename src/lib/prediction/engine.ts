@@ -9,6 +9,13 @@ import {
   placeKalshiDemoOrder,
 } from "@/lib/prediction/kalshi";
 import { getKalshiOpenMarketsStream, getKalshiPrivateStateStream } from "@/lib/prediction/kalshi-stream";
+import {
+  estimateKalshiFeeRounded,
+  marketContractStep,
+  probabilityToCents,
+  snapContractCount,
+  snapProbabilityToMarket,
+} from "@/lib/prediction/fixed-point";
 import { refreshMarkoutTelemetry } from "@/lib/prediction/markouts";
 import { persistCandidateDecisions, persistMarketScan } from "@/lib/storage/prediction-store";
 import {
@@ -583,6 +590,14 @@ function estimateCandidateMoments(candidate: PredictionCandidate) {
   return { mean, variance, cvar };
 }
 
+function candidateContractStep(candidate: Pick<PredictionCandidate, "contractStep">) {
+  return candidate.contractStep ?? 1;
+}
+
+function candidateUnitStake(candidate: Pick<PredictionCandidate, "limitPriceCents" | "contractStep">) {
+  return Math.max(0.01, candidate.limitPriceCents / 100) * candidateContractStep(candidate);
+}
+
 function candidateUtilityScore(candidate: PredictionCandidate, rules: ModeRules): number {
   if (candidate.expectedValuePerDollarRisked <= 0) return -1;
   const { mean, variance, cvar } = estimateCandidateMoments(candidate);
@@ -850,15 +865,22 @@ function estimateKalshiTradingFeeUsd(args: {
     return {
       rate: 0,
       totalUsd: 0,
+      theoreticalUsd: 0,
       schedule: "NONE" as const,
     };
   }
 
   if (isIndexFeeMarket(market)) {
-    const fee = Math.ceil(0.035 * contracts * clamp(price, 0.01, 0.99) * (1 - clamp(price, 0.01, 0.99)) * 100) / 100;
+    const fee = estimateKalshiFeeRounded({
+      contracts,
+      price: clamp(price, 0.01, 0.99),
+      rate: 0.035,
+      schedule: "INDEX",
+    });
     return {
       rate: 0.035,
-      totalUsd: Number(fee.toFixed(4)),
+      totalUsd: Number(fee.chargedUsd.toFixed(4)),
+      theoreticalUsd: Number(fee.theoreticalUsd.toFixed(4)),
       schedule: "INDEX" as const,
     };
   }
@@ -867,23 +889,36 @@ function estimateKalshiTradingFeeUsd(args: {
     return {
       rate: 0,
       totalUsd: 0,
+      theoreticalUsd: 0,
       schedule: "PASSIVE_FREE" as const,
     };
   }
 
   if (role === "MAKER_FEE" || (role === "MAKER" && isMakerFeeMarket(market))) {
-    const fee = Math.ceil(0.0175 * contracts * clamp(price, 0.01, 0.99) * (1 - clamp(price, 0.01, 0.99)) * 100) / 100;
+    const fee = estimateKalshiFeeRounded({
+      contracts,
+      price: clamp(price, 0.01, 0.99),
+      rate: 0.0175,
+      schedule: "MAKER_FEE",
+    });
     return {
       rate: 0.0175,
-      totalUsd: Number(fee.toFixed(4)),
+      totalUsd: Number(fee.chargedUsd.toFixed(4)),
+      theoreticalUsd: Number(fee.theoreticalUsd.toFixed(4)),
       schedule: "MAKER_FEE" as const,
     };
   }
 
-  const fee = Math.ceil(0.07 * contracts * clamp(price, 0.01, 0.99) * (1 - clamp(price, 0.01, 0.99)) * 100) / 100;
+  const fee = estimateKalshiFeeRounded({
+    contracts,
+    price: clamp(price, 0.01, 0.99),
+    rate: 0.07,
+    schedule: "GENERAL",
+  });
   return {
     rate: 0.07,
-    totalUsd: Number(fee.toFixed(4)),
+    totalUsd: Number(fee.chargedUsd.toFixed(4)),
+    theoreticalUsd: Number(fee.theoreticalUsd.toFixed(4)),
     schedule: "GENERAL" as const,
   };
 }
@@ -3168,8 +3203,7 @@ function candidateFromMarket(
     : isSecondaryEntry
       ? Math.max(price, baseStake * rules.secondaryStakeScale)
       : baseStake;
-  const contracts = Math.floor(plannedStake / price);
-  if (contracts < 1) return null;
+  const contractStep = marketContractStep(market);
   const executionAlpha = estimateExecutionAlpha({
     market,
     side: chosenSide,
@@ -3180,8 +3214,14 @@ function candidateFromMarket(
     timeToCloseDays,
     recentMarkoutPenalty: executionHealth.markoutPenalty,
   });
-  const executionPrice = executionAlpha.passivePrice;
+  const executionPrice = snapProbabilityToMarket(
+    executionAlpha.passivePrice,
+    market,
+    executionAlpha.assumedRole === "TAKER" ? "up" : "down",
+  );
   if (!isFiniteNumber(executionPrice) || executionPrice <= 0 || executionPrice >= 1) return null;
+  const contracts = snapContractCount(plannedStake / executionPrice, contractStep, "down");
+  if (contracts < contractStep) return null;
   if (!isFiniteNumber(edge) || !isFiniteNumber(confidence)) return null;
   if (rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice && uncertaintyWidth >= 0.08) return null;
   if (executionAlpha.toxicityScore >= TOXICITY_PASSIVE_SHUTOFF && !robustRulebookPass && !favoriteLongshotActive.autoExecute) return null;
@@ -3366,9 +3406,10 @@ function candidateFromMarket(
     expectedValuePerContract: Number(expectedValuePerContract.toFixed(4)),
     expectedValuePerDollarRisked: Number(expectedValuePerDollarRisked.toFixed(4)),
     confidence: Number(confidence.toFixed(4)),
-    recommendedStakeUsd: Number((contracts * executionPrice).toFixed(2)),
+    recommendedStakeUsd: Number((contracts * executionPrice).toFixed(4)),
     recommendedContracts: contracts,
-    limitPriceCents: Math.round(executionPrice * 100),
+    contractStep,
+    limitPriceCents: probabilityToCents(executionPrice),
     rulebookProb: Number(rulebookEstimate.prob.toFixed(4)),
     rulebookProbLower: Number(rulebookEstimate.lower.toFixed(4)),
     rulebookProbUpper: Number(rulebookEstimate.upper.toFixed(4)),
@@ -3386,7 +3427,7 @@ function candidateFromMarket(
     toxicityScore: Number(executionAlpha.toxicityScore.toFixed(6)),
     riskCluster,
     executionPlan: {
-      limitPriceCents: Math.round(executionPrice * 100),
+      limitPriceCents: probabilityToCents(executionPrice),
       patienceHours: Number(executionAlpha.patienceHours.toFixed(2)),
       fillProbability: Number(executionAlpha.fillProb.toFixed(4)),
       expectedExecutionValueUsd: Number((executionAlpha.valuePerContract * contracts).toFixed(4)),
@@ -3634,38 +3675,44 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
   });
 
   for (const { candidate } of tradableOrdered) {
-    const price = Math.max(0.01, candidate.limitPriceCents / 100);
+    const contractStep = candidateContractStep(candidate);
+    const unitStake = candidateUnitStake(candidate);
     const clusterKey = candidate.riskCluster ?? candidate.category;
     const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
-    if (price > riskRemaining) continue;
-    if (clusterStake + price > clusterStakeLimitUsd) continue;
+    if (unitStake > riskRemaining) continue;
+    if (clusterStake + unitStake > clusterStakeLimitUsd) continue;
     const targetStake = targetStakeByKey.get(candidateKey(candidate)) ?? 0;
     const strongSignal =
       (candidate.compositeScore ?? 0) > SCORE_THRESHOLD_BY_MODE[mode] * 1.35 ||
       (candidate.executionPlan?.fillProbability ?? 0) >= 0.62 ||
       ((candidate.executionAlphaUsd ?? 0) > (candidate.feeEstimateUsd ?? 0) && (candidate.toxicityScore ?? 0) < 0.72);
-    if (targetStake >= price * 0.55 || strongSignal) {
-      allocatedContracts.set(candidateKey(candidate), 1);
-      allocatedStakeByCluster.set(clusterKey, clusterStake + price);
-      riskRemaining = Number((riskRemaining - price).toFixed(4));
+    if (targetStake >= unitStake * 0.55 || strongSignal) {
+      allocatedContracts.set(candidateKey(candidate), contractStep);
+      allocatedStakeByCluster.set(clusterKey, clusterStake + unitStake);
+      riskRemaining = Number((riskRemaining - unitStake).toFixed(4));
     }
   }
 
   if (![...allocatedContracts.values()].some((value) => value > 0)) {
     const top = tradableOrdered[0]?.candidate;
     if (top) {
-      const price = Math.max(0.01, top.limitPriceCents / 100);
+      const contractStep = candidateContractStep(top);
+      const unitStake = candidateUnitStake(top);
       const clusterKey = top.riskCluster ?? top.category;
       const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
-      if (price <= riskRemaining) {
-        allocatedContracts.set(candidateKey(top), 1);
-        allocatedStakeByCluster.set(clusterKey, clusterStake + price);
-        riskRemaining = Number((riskRemaining - price).toFixed(4));
+      if (unitStake <= riskRemaining) {
+        allocatedContracts.set(candidateKey(top), contractStep);
+        allocatedStakeByCluster.set(clusterKey, clusterStake + unitStake);
+        riskRemaining = Number((riskRemaining - unitStake).toFixed(4));
       }
     }
   }
 
-  const minPrice = Math.min(...tradableOrdered.map(({ candidate }) => Math.max(0.01, candidate.limitPriceCents / 100)));
+  const minPrice = Math.min(
+    ...tradableOrdered.map(({ candidate }) => {
+      return candidateUnitStake(candidate);
+    }),
+  );
   let guard = 0;
   while (riskRemaining >= minPrice && guard < 4000) {
     guard += 1;
@@ -3675,21 +3722,24 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
     for (const { candidate } of tradableOrdered) {
       const key = candidateKey(candidate);
       const price = Math.max(0.01, candidate.limitPriceCents / 100);
+      const contractStep = candidateContractStep(candidate);
+      const unitStake = candidateUnitStake(candidate);
       const clusterKey = candidate.riskCluster ?? candidate.category;
       const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
-      if (price > riskRemaining) continue;
-      if (clusterStake + price > clusterStakeLimitUsd) continue;
+      if (unitStake > riskRemaining) continue;
+      if (clusterStake + unitStake > clusterStakeLimitUsd) continue;
 
       const currentContracts = allocatedContracts.get(key) ?? 0;
       const currentStake = currentContracts * price;
       const targetStake = targetStakeByKey.get(key) ?? 0;
       const gapBoost = currentStake < targetStake ? 1.25 : 0.55;
       const diminishing = Math.sqrt(1 + currentContracts);
+      const executionBaseContracts = Math.max(contractStep, candidate.recommendedContracts);
       const marginal =
         (
           (candidate.compositeScore ?? 0) * 0.9 +
           candidate.expectedValuePerDollarRisked * 0.55 +
-          ((candidate.executionAlphaUsd ?? 0) / Math.max(1, candidate.recommendedContracts)) * 0.4 +
+          ((candidate.executionAlphaUsd ?? 0) / executionBaseContracts) * 0.4 +
           (candidate.executionAdjustedEdge ?? 0) * 0.35
         ) *
         gapBoost /
@@ -3705,10 +3755,11 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
 
     const bestKey = candidateKey(bestCandidate);
     const bestPrice = Math.max(0.01, bestCandidate.limitPriceCents / 100);
+    const bestStep = candidateContractStep(bestCandidate);
     const bestClusterKey = bestCandidate.riskCluster ?? bestCandidate.category;
-    allocatedContracts.set(bestKey, (allocatedContracts.get(bestKey) ?? 0) + 1);
-    allocatedStakeByCluster.set(bestClusterKey, (allocatedStakeByCluster.get(bestClusterKey) ?? 0) + bestPrice);
-    riskRemaining = Number((riskRemaining - bestPrice).toFixed(4));
+    allocatedContracts.set(bestKey, Number(((allocatedContracts.get(bestKey) ?? 0) + bestStep).toFixed(6)));
+    allocatedStakeByCluster.set(bestClusterKey, (allocatedStakeByCluster.get(bestClusterKey) ?? 0) + bestPrice * bestStep);
+    riskRemaining = Number((riskRemaining - bestPrice * bestStep).toFixed(4));
   }
 
   for (const { candidate, index } of buyPriority) {
@@ -3725,22 +3776,23 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
 
     const price = Math.max(0.01, candidate.limitPriceCents / 100);
     const contracts = allocatedContracts.get(candidateKey(candidate)) ?? 0;
-    const finalStake = Number((contracts * price).toFixed(2));
+    const finalStake = Number((contracts * price).toFixed(4));
     const targetWeight = maxDailyRiskUsd > 0 ? finalStake / maxDailyRiskUsd : 0;
+    const executionBaseContracts = Math.max(candidateContractStep(candidate), candidate.recommendedContracts);
 
     out[index] = {
       ...candidate,
       recommendedContracts: contracts,
-      recommendedStakeUsd: finalStake,
+      recommendedStakeUsd: Number(finalStake.toFixed(4)),
       portfolioWeight: Number(targetWeight.toFixed(6)),
       netAlphaUsd: Number((candidate.expectedValuePerContract * contracts).toFixed(4)),
       executionPlan: candidate.executionPlan
         ? {
             ...candidate.executionPlan,
             expectedExecutionValueUsd: Number(
-              (((candidate.executionPlan.expectedExecutionValueUsd / Math.max(1, candidate.recommendedContracts)) || 0) * contracts).toFixed(4),
+              (((candidate.executionPlan.expectedExecutionValueUsd / executionBaseContracts) || 0) * contracts).toFixed(4),
             ),
-            feeUsd: Number((((candidate.executionPlan.feeUsd / Math.max(1, candidate.recommendedContracts)) || 0) * contracts).toFixed(4)),
+            feeUsd: Number((((candidate.executionPlan.feeUsd / executionBaseContracts) || 0) * contracts).toFixed(4)),
           }
         : undefined,
     };
@@ -3765,7 +3817,7 @@ function actionableCandidates(planned: PredictionCandidate[], mode: AutomationMo
 function deriveActionableTarget(selected: PredictionCandidate[], maxDailyRiskUsd: number, mode: AutomationMode) {
   const priced = selected
     .filter((candidate) => isBuyVerdict(candidate.verdict))
-    .map((candidate) => Math.max(0.01, candidate.limitPriceCents / 100))
+    .map((candidate) => candidateUnitStake(candidate))
     .sort((a, b) => a - b);
   if (!priced.length) return MIN_ACTIONABLE_TARGET_BY_MODE[mode];
   const medianPrice = priced[Math.floor(priced.length / 2)] ?? priced[0];
@@ -3850,8 +3902,11 @@ function buildExploratoryCandidates(
         category === "BITCOIN"
           ? Math.max(2, Math.min(accountBalanceUsd * rules.perTradeRiskPct * 1.35, 4.5))
           : Math.max(1, Math.min(accountBalanceUsd * rules.perTradeRiskPct, 2));
-      const contracts = Math.max(1, Math.floor(exploratoryRisk / picked.preferred.price));
-      const stake = Number((contracts * picked.preferred.price).toFixed(2));
+      const contractStep = marketContractStep(picked.market);
+      const executionPrice = snapProbabilityToMarket(picked.preferred.price, picked.market, "down");
+      const contracts = snapContractCount(exploratoryRisk / executionPrice, contractStep, "down");
+      if (contracts < contractStep) continue;
+      const stake = Number((contracts * executionPrice).toFixed(4));
       const opportunityType: OpportunityType = "WATCHLIST";
       const timeToCloseDays = Number(daysUntil(picked.market.closeTime).toFixed(2));
       const spread = Math.max(
@@ -3860,9 +3915,9 @@ function buildExploratoryCandidates(
       );
       const liquidityScore = clamp(Math.log1p(picked.market.volume + picked.market.openInterest) / 8, 0.08, 1);
       const exploratoryModelProb = picked.hasHighProbOption
-        ? clamp(picked.preferred.price + 0.004, picked.preferred.price, 0.98)
+        ? clamp(executionPrice + 0.004, executionPrice, 0.98)
         : 0.5;
-      const exploratoryEdge = Number((exploratoryModelProb - picked.preferred.price).toFixed(4));
+      const exploratoryEdge = Number((exploratoryModelProb - executionPrice).toFixed(4));
       const exploratoryConfidence = picked.hasHighProbOption ? 0.42 : 0.35;
       const capitalTimeDays = estimateCapitalTimeDays(picked.market);
       const exploratoryNetAlpha = Number((exploratoryEdge * contracts).toFixed(4));
@@ -3902,7 +3957,7 @@ function buildExploratoryCandidates(
           ? buildStrategicBreakdown({
               market: picked.market,
               side: picked.preferred.side,
-              marketProb: picked.preferred.price,
+              marketProb: executionPrice,
               modelProb: exploratoryModelProb,
               edge: exploratoryEdge,
               confidence: exploratoryConfidence,
@@ -3921,21 +3976,22 @@ function buildExploratoryCandidates(
         title: picked.market.title,
         category: picked.market.category,
         side: picked.preferred.side,
-        marketProb: Number(picked.preferred.price.toFixed(4)),
+        marketProb: Number(executionPrice.toFixed(4)),
         modelProb: Number(exploratoryModelProb.toFixed(4)),
         edge: exploratoryEdge,
         expectedValuePerContract: exploratoryEdge,
-        expectedValuePerDollarRisked: Number((exploratoryEdge / Math.max(0.01, picked.preferred.price)).toFixed(4)),
+        expectedValuePerDollarRisked: Number((exploratoryEdge / Math.max(0.01, executionPrice)).toFixed(4)),
         confidence: exploratoryConfidence,
         recommendedStakeUsd: stake,
         recommendedContracts: contracts,
-        limitPriceCents: Math.round(picked.preferred.price * 100),
+        contractStep,
+        limitPriceCents: probabilityToCents(executionPrice),
         netAlphaUsd: exploratoryNetAlpha,
         capitalTimeDays: Number(capitalTimeDays.toFixed(6)),
         compositeScore: Number(exploratoryScore.toFixed(6)),
         portfolioWeight: 0,
         executionPlan: {
-          limitPriceCents: Math.round(picked.preferred.price * 100),
+          limitPriceCents: probabilityToCents(executionPrice),
           patienceHours: 0.08,
           fillProbability: picked.hasHighProbOption ? 0.68 : 0.42,
           expectedExecutionValueUsd: exploratoryNetAlpha,
@@ -4226,19 +4282,20 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       .sort((a, b) => candidateUtilityScore(b, rules) - candidateUtilityScore(a, rules))[0];
 
     if (oneContractFallback) {
-      const oneContractStake = Number((oneContractFallback.limitPriceCents / 100).toFixed(2));
+      const fallbackContracts = candidateContractStep(oneContractFallback);
+      const oneContractStake = Number(candidateUnitStake(oneContractFallback).toFixed(4));
       const emergencyReserve = Number(Math.max(0.2, accountBalanceUsd * 0.2).toFixed(2));
       if (oneContractStake > 0 && oneContractStake <= accountBalanceUsd && oneContractStake <= emergencyReserve) {
         const fallbackCandidate = {
           ...oneContractFallback,
-          recommendedContracts: 1,
+          recommendedContracts: fallbackContracts,
           recommendedStakeUsd: oneContractStake,
           executionMessage:
-            "One-contract fallback: allocated minimal exposure because risk-cap rounding removed all BUY candidates.",
+            "Minimum-step fallback: allocated the smallest valid contract size because risk-cap rounding removed all BUY candidates.",
         };
         queueByKey.set(candidateKey(fallbackCandidate), fallbackCandidate);
         actionable = [fallbackCandidate];
-        warnings.push("One-contract fallback activated to preserve signal continuity under tight risk-cap conditions.");
+        warnings.push("Minimum-step fallback activated to preserve signal continuity under tight risk-cap conditions.");
       }
     }
   }
@@ -4255,21 +4312,22 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       : null;
 
     if (btcMainstay) {
-      const oneContractStake = Number((btcMainstay.limitPriceCents / 100).toFixed(2));
+      const fallbackContracts = candidateContractStep(btcMainstay);
+      const oneContractStake = Number(candidateUnitStake(btcMainstay).toFixed(4));
       const mainstayReserve = Number(Math.max(0.35, accountBalanceUsd * 0.35).toFixed(2));
 
       if (oneContractStake > 0 && oneContractStake <= accountBalanceUsd && oneContractStake <= mainstayReserve) {
         const overrideCandidate = {
           ...btcMainstay,
-          recommendedContracts: 1,
+          recommendedContracts: fallbackContracts,
           recommendedStakeUsd: oneContractStake,
           executionMessage:
-            "BTC mainstay override: 1 micro-contract allocated because risk-cap rounding produced zero BTC contracts.",
+            "BTC mainstay override: minimum valid BTC contract step allocated because risk-cap rounding produced zero BTC exposure.",
         };
         queueByKey.set(candidateKey(overrideCandidate), overrideCandidate);
         actionable = [...actionable, overrideCandidate];
         warnings.push(
-          "BTC mainstay override activated: allocated one micro BTC contract despite tight risk-cap rounding.",
+          "BTC mainstay override activated: allocated the minimum valid BTC contract step despite tight risk-cap rounding.",
         );
       }
     }
@@ -4337,6 +4395,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         side: candidate.side,
         count: candidate.recommendedContracts,
         limitPriceCents: candidate.limitPriceCents,
+        contractStep: candidate.contractStep,
       });
 
       executedStake += candidate.recommendedStakeUsd;
