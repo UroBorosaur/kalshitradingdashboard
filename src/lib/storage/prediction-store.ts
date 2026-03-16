@@ -19,6 +19,7 @@ import type {
   StoredKalshiOrderEvent,
   StoredKalshiPositionEvent,
   StoredKalshiQuoteEvent,
+  StoredKalshiStreamEvent,
   StoredMarkoutEvent,
   StoredOrderbookEvent,
   StoredResolutionEvent,
@@ -426,6 +427,22 @@ export async function persistCandidateDecisions(args: {
   await appendPredictionEvents("raw", "candidate_decisions", events);
 }
 
+export async function persistStreamEvents(args: {
+  source: string;
+  events: StoredKalshiStreamEvent[];
+}) {
+  const envelopes = args.events.map((payload, index) =>
+    makeEnvelope<StoredKalshiStreamEvent>(
+      "stream_events",
+      "raw",
+      args.source,
+      `stream:${payload.eventType}:${payload.marketTicker ?? payload.channel ?? "global"}:${payload.sid ?? "na"}:${payload.seq ?? index}`,
+      payload,
+    ),
+  );
+  await appendPredictionEvents("raw", "stream_events", envelopes);
+}
+
 export async function readStoredMarkoutsSince(sinceMs: number) {
   return readPredictionEventsSince<StoredMarkoutEvent>("derived", "markouts", sinceMs);
 }
@@ -448,6 +465,7 @@ export async function persistMarkoutEvents(
 
 export async function loadPredictionReplayDay(day: string): Promise<PredictionReplayDay> {
   const [
+    streamEvents,
     fills,
     orders,
     positions,
@@ -457,6 +475,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     resolutions,
     markouts,
   ] = await Promise.all([
+    readPredictionEventsForDay<StoredKalshiStreamEvent>("raw", "stream_events", day),
     readPredictionEventsForDay<StoredKalshiFillEvent>("raw", "fills", day),
     readPredictionEventsForDay<StoredKalshiOrderEvent>("raw", "orders", day),
     readPredictionEventsForDay<StoredKalshiPositionEvent>("raw", "positions", day),
@@ -468,6 +487,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
   ]);
 
   return {
+    streamEvents,
     fills,
     orders,
     positions,
@@ -480,14 +500,15 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
 }
 
 const REPLAY_STREAM_ORDER: Record<PredictionReplayEvent["stream"], number> = {
-  fills: 0,
-  orders: 1,
-  positions: 2,
-  quotes: 3,
-  orderbook_events: 4,
-  candidate_decisions: 5,
-  resolutions: 6,
-  markouts: 7,
+  stream_events: 0,
+  fills: 1,
+  orders: 2,
+  positions: 3,
+  quotes: 4,
+  orderbook_events: 5,
+  candidate_decisions: 6,
+  resolutions: 7,
+  markouts: 8,
 };
 
 function compareReplayEvents(a: PredictionReplayEvent, b: PredictionReplayEvent) {
@@ -508,6 +529,7 @@ function compareReplayEvents(a: PredictionReplayEvent, b: PredictionReplayEvent)
 export async function loadPredictionReplayTimeline(day: string): Promise<PredictionReplayEvent[]> {
   const replayDay = await loadPredictionReplayDay(day);
   return [
+    ...replayDay.streamEvents,
     ...replayDay.fills,
     ...replayDay.orders,
     ...replayDay.positions,

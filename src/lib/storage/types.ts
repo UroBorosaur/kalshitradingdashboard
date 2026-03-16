@@ -9,6 +9,7 @@ import type {
 
 export type PredictionStorageLayer = "raw" | "derived";
 export type PredictionStorageStream =
+  | "stream_events"
   | "fills"
   | "orders"
   | "positions"
@@ -39,6 +40,17 @@ export interface StoredKalshiFillEvent {
   yesPriceCents?: number;
   noPriceCents?: number;
   createdTime?: string;
+}
+
+export interface StoredKalshiStreamEvent {
+  eventType: string;
+  channel?: string;
+  sid?: number;
+  seq?: number;
+  marketTicker?: string;
+  marketTickers?: string[];
+  controlFrame?: "ping" | "pong";
+  raw: unknown;
 }
 
 export interface StoredKalshiOrderEvent {
@@ -186,6 +198,7 @@ export interface StoredMarkoutEvent {
 }
 
 export interface PredictionReplayDay {
+  streamEvents: Array<PredictionStorageEnvelope<StoredKalshiStreamEvent>>;
   fills: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>>;
   orders: Array<PredictionStorageEnvelope<StoredKalshiOrderEvent>>;
   positions: Array<PredictionStorageEnvelope<StoredKalshiPositionEvent>>;
@@ -197,6 +210,7 @@ export interface PredictionReplayDay {
 }
 
 export type PredictionReplayEvent =
+  | PredictionStorageEnvelope<StoredKalshiStreamEvent>
   | PredictionStorageEnvelope<StoredKalshiFillEvent>
   | PredictionStorageEnvelope<StoredKalshiOrderEvent>
   | PredictionStorageEnvelope<StoredKalshiPositionEvent>

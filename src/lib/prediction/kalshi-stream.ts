@@ -22,6 +22,8 @@ import {
   getKalshiWebSocketBaseUrl,
   kalshiConnectionStatus,
 } from "@/lib/prediction/kalshi";
+import { persistStreamEvents } from "@/lib/storage/prediction-store";
+import type { StoredKalshiStreamEvent } from "@/lib/storage/types";
 import type {
   KalshiFillLite,
   KalshiOrderLite,
@@ -38,6 +40,8 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
 const HEARTBEAT_TIMEOUT_MS = 25_000;
 const MAX_RECONNECT_DELAY_MS = 15_000;
 const RECONNECT_BASE_DELAY_MS = 1_000;
+const STREAM_PERSIST_FLUSH_MS = 250;
+const STREAM_PERSIST_BATCH_SIZE = 100;
 
 type KalshiStreamChannel = "ticker" | "orderbook_delta" | "user_orders" | "fill" | "market_positions";
 
@@ -174,6 +178,42 @@ function sortByTimestampDesc<T>(rows: T[], timestampFn: (row: T) => string | und
   });
 }
 
+function firstDefinedString(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function normalizeStreamEvent(message: Record<string, unknown>): StoredKalshiStreamEvent {
+  const nestedPayload =
+    message.msg && typeof message.msg === "object" && !Array.isArray(message.msg)
+      ? (message.msg as Record<string, unknown>)
+      : null;
+  const payload = nestedPayload ?? message;
+  const marketTicker = firstDefinedString(
+    payload.market_ticker,
+    payload.ticker,
+    message.market_ticker,
+    message.ticker,
+  )?.toUpperCase();
+  const marketTickers = Array.isArray(message.market_tickers)
+    ? message.market_tickers.filter((value): value is string => typeof value === "string").map((value) => value.toUpperCase())
+    : Array.isArray(payload.market_tickers)
+      ? payload.market_tickers.filter((value): value is string => typeof value === "string").map((value) => value.toUpperCase())
+      : undefined;
+
+  return {
+    eventType: firstDefinedString(message.type, payload.type) ?? "unknown",
+    channel: firstDefinedString(message.channel, payload.channel),
+    sid: toNumber(message.sid ?? payload.sid) ?? undefined,
+    seq: toNumber(message.seq ?? payload.seq) ?? undefined,
+    marketTicker,
+    marketTickers,
+    raw: message,
+  };
+}
+
 class KalshiStreamService {
   private socket: WebSocket | null = null;
   private connectPromise: Promise<void> | null = null;
@@ -210,6 +250,9 @@ class KalshiStreamService {
   private orders = new Map<string, KalshiOrderLite>();
   private fills = new Map<string, KalshiFillLite>();
   private positions = new Map<string, KalshiPositionLite>();
+  private streamEventBuffer: StoredKalshiStreamEvent[] = [];
+  private streamPersistTimer: NodeJS.Timeout | null = null;
+  private streamPersistPromise: Promise<void> = Promise.resolve();
 
   private websocketUrl() {
     return getKalshiWebSocketBaseUrl();
@@ -291,6 +334,7 @@ class KalshiStreamService {
 
   private clearSocket() {
     this.stopHeartbeat();
+    void this.flushStreamEventBuffer();
     if (this.socket) {
       try {
         this.socket.close();
@@ -320,6 +364,41 @@ class KalshiStreamService {
   private onError(error: Error) {
     this.lastError = error.message;
     this.scheduleReconnect(`socket error: ${error.message}`);
+  }
+
+  private queueStreamEvent(event: StoredKalshiStreamEvent) {
+    this.streamEventBuffer.push(event);
+    if (this.streamEventBuffer.length >= STREAM_PERSIST_BATCH_SIZE) {
+      void this.flushStreamEventBuffer();
+      return;
+    }
+    if (this.streamPersistTimer) return;
+    this.streamPersistTimer = setTimeout(() => {
+      this.streamPersistTimer = null;
+      void this.flushStreamEventBuffer();
+    }, STREAM_PERSIST_FLUSH_MS);
+  }
+
+  private async flushStreamEventBuffer() {
+    if (this.streamPersistTimer) {
+      clearTimeout(this.streamPersistTimer);
+      this.streamPersistTimer = null;
+    }
+    if (!this.streamEventBuffer.length) return;
+
+    const batch = this.streamEventBuffer.splice(0, this.streamEventBuffer.length);
+    this.streamPersistPromise = this.streamPersistPromise
+      .then(async () => {
+        await persistStreamEvents({
+          source: "kalshi-stream/ws",
+          events: batch,
+        });
+      })
+      .catch((error) => {
+        this.lastError = `stream event persistence failed: ${(error as Error).message}`;
+      });
+
+    await this.streamPersistPromise;
   }
 
   private parseJson(data: WebSocket.RawData): Record<string, unknown> | null {
@@ -785,13 +864,26 @@ class KalshiStreamService {
       });
       socket.on("message", (data) => {
         const parsed = this.parseJson(data);
-        if (parsed) this.handleMessage(parsed);
+        if (parsed) {
+          this.queueStreamEvent(normalizeStreamEvent(parsed));
+          this.handleMessage(parsed);
+        }
       });
       socket.on("ping", () => {
         this.lastControlPingAtMs = Date.now();
+        this.queueStreamEvent({
+          eventType: "control_ping",
+          controlFrame: "ping",
+          raw: { type: "control_ping" },
+        });
       });
       socket.on("pong", () => {
         this.lastControlPongAtMs = Date.now();
+        this.queueStreamEvent({
+          eventType: "control_pong",
+          controlFrame: "pong",
+          raw: { type: "control_pong" },
+        });
       });
       socket.on("error", (error) => {
         clearTimeout(timeout);
