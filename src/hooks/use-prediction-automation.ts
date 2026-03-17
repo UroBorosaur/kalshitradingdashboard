@@ -29,6 +29,7 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   spreadMultiplier: 1,
   liquidityMultiplier: 1,
   highProbModelMin: 0.9,
+  highProbMarketMin: 0.82,
   highProbabilityEnabled: true,
   favoriteLongshotEnabled: true,
   throughputRecoveryEnabled: true,

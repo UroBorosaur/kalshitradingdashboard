@@ -444,6 +444,7 @@ export interface AutomationControls {
   spreadMultiplier: number;
   liquidityMultiplier: number;
   highProbModelMin: number;
+  highProbMarketMin: number;
   highProbabilityEnabled: boolean;
   favoriteLongshotEnabled: boolean;
   throughputRecoveryEnabled: boolean;

@@ -47,7 +47,7 @@ const categoryOptions: PredictionCategory[] = [
 const sliderControls: Array<{
   key: keyof Pick<
     AutomationControls,
-    "edgeMultiplier" | "confidenceShift" | "spreadMultiplier" | "liquidityMultiplier" | "highProbModelMin"
+    "edgeMultiplier" | "confidenceShift" | "spreadMultiplier" | "liquidityMultiplier" | "highProbModelMin" | "highProbMarketMin"
   >;
   label: string;
   min: number;
@@ -104,13 +104,24 @@ const sliderControls: Array<{
   },
   {
     key: "highProbModelMin",
-    label: "High-Prob Floor",
+    label: "Model High-Prob Floor",
     min: 0.5,
     max: 0.97,
     step: 0.01,
-    description: "Minimum model probability for the high-probability, low-EV execution lane.",
-    effectLow: "Lower = more high-probability fallback orders.",
-    effectHigh: "Higher = fewer fallback orders, stronger hit-rate target.",
+    description: "Minimum selected-side model probability for the high-probability execution lane.",
+    effectLow: "Lower = more orders get through the high-probability lane.",
+    effectHigh: "Higher = fewer orders get through; stronger hit-rate required.",
+    format: (value) => `${(value * 100).toFixed(0)}%`,
+  },
+  {
+    key: "highProbMarketMin",
+    label: "Implied High-Prob Floor",
+    min: 0.5,
+    max: 0.97,
+    step: 0.01,
+    description: "Minimum selected-side market-implied probability required by the same high-probability gate.",
+    effectLow: "Lower = more mid-priced markets can qualify.",
+    effectHigh: "Higher = only already-expensive favorites qualify.",
     format: (value) => `${(value * 100).toFixed(0)}%`,
   },
 ];

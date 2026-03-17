@@ -274,7 +274,6 @@ const BITCOIN_MICRO_HIGH_PROB_MODEL_MIN = 0.6;
 const BITCOIN_MICRO_HIGH_PROB_MARKET_MIN = 0.6;
 const BITCOIN_MICRO_HIGH_PROB_EDGE_MIN = 0.006;
 const BITCOIN_MICRO_HIGH_PROB_CONFIDENCE_MIN = 0.44;
-const GLOBAL_HIGH_PROB_MARKET_PROB_MIN = 0.68;
 const UNCERTAINTY_QUOTE_WIDENING_ALPHA = 0.65;
 const TOXICITY_WIDEN_THRESHOLD = 0.55;
 const TOXICITY_PASSIVE_SHUTOFF = 0.82;
@@ -311,6 +310,7 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   spreadMultiplier: 1,
   liquidityMultiplier: 1,
   highProbModelMin: 0.9,
+  highProbMarketMin: 0.82,
   highProbabilityEnabled: true,
   favoriteLongshotEnabled: true,
   throughputRecoveryEnabled: true,
@@ -450,6 +450,7 @@ function normalizeAutomationControls(input?: Partial<AutomationControls>): Autom
     spreadMultiplier: clamp(input?.spreadMultiplier ?? DEFAULT_AUTOMATION_CONTROLS.spreadMultiplier, 0.7, 1.6),
     liquidityMultiplier: clamp(input?.liquidityMultiplier ?? DEFAULT_AUTOMATION_CONTROLS.liquidityMultiplier, 0.5, 1.6),
     highProbModelMin: clamp(input?.highProbModelMin ?? DEFAULT_AUTOMATION_CONTROLS.highProbModelMin, 0.5, 0.97),
+    highProbMarketMin: clamp(input?.highProbMarketMin ?? DEFAULT_AUTOMATION_CONTROLS.highProbMarketMin, 0.5, 0.97),
     highProbabilityEnabled: input?.highProbabilityEnabled ?? DEFAULT_AUTOMATION_CONTROLS.highProbabilityEnabled,
     favoriteLongshotEnabled: input?.favoriteLongshotEnabled ?? DEFAULT_AUTOMATION_CONTROLS.favoriteLongshotEnabled,
     throughputRecoveryEnabled: input?.throughputRecoveryEnabled ?? DEFAULT_AUTOMATION_CONTROLS.throughputRecoveryEnabled,
@@ -474,6 +475,7 @@ function applyAutomationControls(baseRules: ModeRules, controls: AutomationContr
       baseRules.secondaryMinLiquidityScore === null ? null : clamp(baseRules.secondaryMinLiquidityScore * controls.liquidityMultiplier, 0.05, 0.95),
     highProbTargetShare: controls.highProbabilityEnabled ? baseRules.highProbTargetShare : 0,
     highProbMinModelProb: controls.highProbabilityEnabled ? controls.highProbModelMin : 0.999,
+    highProbMinMarketProb: controls.highProbabilityEnabled ? controls.highProbMarketMin : 0.999,
     highProbDailyRiskFloorUsd: controls.highProbabilityEnabled ? baseRules.highProbDailyRiskFloorUsd : 0,
   };
 }
@@ -757,17 +759,7 @@ function resolveGlobalHighProbThresholds(args: {
   timeToCloseDays: number | null | undefined;
   rules: ModeRules;
 }): HighProbThresholds {
-  const thresholds = resolveHighProbThresholds(args);
-  const isBtcMicro = args.category === "BITCOIN" && (args.timeToCloseDays ?? 99) <= BITCOIN_MICRO_HORIZON_DAYS;
-
-  if (isBtcMicro) return thresholds;
-
-  return {
-    modelMin: thresholds.modelMin,
-    marketMin: Math.max(GLOBAL_HIGH_PROB_MARKET_PROB_MIN, Math.min(thresholds.marketMin, 0.82)),
-    edgeMin: thresholds.edgeMin,
-    confidenceMin: thresholds.confidenceMin,
-  };
+  return resolveHighProbThresholds(args);
 }
 
 function meetsGlobalHighProbabilityDefinition(args: {
