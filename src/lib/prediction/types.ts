@@ -203,6 +203,8 @@ export interface SilentClockContribution {
   checkpointProgress: number;
   decayPenalty: number;
   adjustedProbability: number;
+  probabilityDelta?: number;
+  scoreContribution?: number | null;
   rationale: string;
 }
 
@@ -214,7 +216,23 @@ export interface LeadLagSignal {
   confidence: number;
   direction: "UP" | "DOWN";
   adjustedProbability: number;
+  probabilityDelta?: number;
+  scoreContribution?: number | null;
   rationale: string;
+}
+
+export interface OverlayPerformanceSlice {
+  decisions: number;
+  placed: number;
+  fillRate: number | null;
+  avgProbabilityContribution: number | null;
+  avgScoreContribution: number | null;
+  avgExecutionAdjustedEdge: number | null;
+  avgMarkout30s: number | null;
+  avgMarkoutExpiry: number | null;
+  avgExpiryPnlUsd: number | null;
+  toxicityOverlapRate: number | null;
+  clusterStressOverlapRate: number | null;
 }
 
 export interface CandidateGateDiagnostic {
@@ -500,6 +518,8 @@ export interface SignalOverlayAttributionSummary {
   leadLagCount: number;
   avgSilentClockPenalty: number | null;
   avgLeadLagSignal: number | null;
+  silentClockPerformance: OverlayPerformanceSlice;
+  leadLagPerformance: OverlayPerformanceSlice;
   recentSilentClock: SilentClockContribution[];
   recentLeadLag: LeadLagSignal[];
 }
@@ -608,6 +628,11 @@ export interface ExecutionAttributionTrade {
   inventorySkew?: number | null;
   staleHazard?: number | null;
   quoteWidening?: number | null;
+  silentClockProbabilityContribution?: number | null;
+  silentClockScoreContribution?: number | null;
+  leadLagProbabilityContribution?: number | null;
+  leadLagScoreContribution?: number | null;
+  clusterStress?: boolean;
   limitPriceCents: number;
   executionRole?: ExecutionPlanRole;
   fillProbability?: number | null;

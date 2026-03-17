@@ -434,6 +434,9 @@ interface ExpertMixtureResult {
 interface ModelProbabilityEstimate {
   rawModelProb: number;
   modelProb: number;
+  overlaylessRawModelProb?: number;
+  rawModelProbWithoutSilentClock?: number;
+  rawModelProbWithoutLeadLag?: number;
   marketProb: number;
   rationale: string[];
   probabilityTransform: ProbabilityTransform;
@@ -3182,6 +3185,40 @@ function estimateModelProbability(
     timeToCloseDays,
     inferredRegime,
   });
+  const expertsWithoutOverlays = experts.filter((expert) => expert.expert !== "silent_clock" && expert.expert !== "lead_lag");
+  const overlaylessExpertMixture =
+    expertsWithoutOverlays.length && expertsWithoutOverlays.length !== experts.length
+      ? mixExpertProbabilities({
+          experts: expertsWithoutOverlays,
+          category: market.category,
+          liquidityScore,
+          spread,
+          timeToCloseDays,
+          inferredRegime,
+        })
+      : expertMixture;
+  const withoutSilentClockMixture =
+    experts.some((expert) => expert.expert === "silent_clock")
+      ? mixExpertProbabilities({
+          experts: experts.filter((expert) => expert.expert !== "silent_clock"),
+          category: market.category,
+          liquidityScore,
+          spread,
+          timeToCloseDays,
+          inferredRegime,
+        })
+      : null;
+  const withoutLeadLagMixture =
+    experts.some((expert) => expert.expert === "lead_lag")
+      ? mixExpertProbabilities({
+          experts: experts.filter((expert) => expert.expert !== "lead_lag"),
+          category: market.category,
+          liquidityScore,
+          spread,
+          timeToCloseDays,
+          inferredRegime,
+        })
+      : null;
   rationale.push(...expertMixture.rationale);
   let rawModelProb = expertMixture.probability;
 
@@ -3204,13 +3241,30 @@ function estimateModelProbability(
   return {
     rawModelProb: clamp(rawModelProb, 0.02, 0.98),
     modelProb,
+    overlaylessRawModelProb: clamp(overlaylessExpertMixture.probability, 0.02, 0.98),
+    rawModelProbWithoutSilentClock: withoutSilentClockMixture
+      ? clamp(withoutSilentClockMixture.probability, 0.02, 0.98)
+      : undefined,
+    rawModelProbWithoutLeadLag: withoutLeadLagMixture ? clamp(withoutLeadLagMixture.probability, 0.02, 0.98) : undefined,
     marketProb: implied,
     rationale,
     probabilityTransform: expertMixture.transform,
     calibrationMethod,
     expertWeights: expertMixture.weights,
-    silentClock,
-    leadLag,
+    silentClock:
+      silentClock && withoutSilentClockMixture
+        ? {
+            ...silentClock,
+            probabilityDelta: Number((rawModelProb - withoutSilentClockMixture.probability).toFixed(6)),
+          }
+        : silentClock,
+    leadLag:
+      leadLag && withoutLeadLagMixture
+        ? {
+            ...leadLag,
+            probabilityDelta: Number((rawModelProb - withoutLeadLagMixture.probability).toFixed(6)),
+          }
+        : leadLag,
   };
 }
 
@@ -3488,6 +3542,52 @@ function candidateFromMarket(
   });
   const capitalTimeDays = estimateCapitalTimeDays(market) + rulebookEstimate.settlementLagDays;
   const capitalLocked = contracts * executionPrice;
+  const temperature = TEMPERATURE_BY_CATEGORY[market.category] ?? 1;
+  const overlaylessModelProb =
+    probabilityEstimate.overlaylessRawModelProb !== undefined
+      ? clamp(temperatureScaleProbability(probabilityEstimate.overlaylessRawModelProb, temperature), 0.02, 0.98)
+      : modelProb;
+  const silentClockModelProbWithout =
+    probabilityEstimate.rawModelProbWithoutSilentClock !== undefined
+      ? clamp(temperatureScaleProbability(probabilityEstimate.rawModelProbWithoutSilentClock, temperature), 0.02, 0.98)
+      : undefined;
+  const leadLagModelProbWithout =
+    probabilityEstimate.rawModelProbWithoutLeadLag !== undefined
+      ? clamp(temperatureScaleProbability(probabilityEstimate.rawModelProbWithoutLeadLag, temperature), 0.02, 0.98)
+      : undefined;
+  const selectedSilentContribution =
+    silentClockModelProbWithout !== undefined
+      ? Number(
+          (
+            (chosenSide === "YES" ? modelProb - silentClockModelProbWithout : silentClockModelProbWithout - modelProb)
+          ).toFixed(6),
+        )
+      : undefined;
+  const selectedLeadLagContribution =
+    leadLagModelProbWithout !== undefined
+      ? Number(
+          (
+            (chosenSide === "YES" ? modelProb - leadLagModelProbWithout : leadLagModelProbWithout - modelProb)
+          ).toFixed(6),
+        )
+      : undefined;
+  const overlayScoreDenominator = Math.max(0.01, executionPrice * capitalTimeDays);
+  const silentClockContribution =
+    probabilityEstimate.silentClock && selectedSilentContribution !== undefined
+      ? {
+          ...probabilityEstimate.silentClock,
+          probabilityDelta: selectedSilentContribution,
+          scoreContribution: Number((selectedSilentContribution / overlayScoreDenominator).toFixed(6)),
+        }
+      : probabilityEstimate.silentClock;
+  const leadLagContribution =
+    probabilityEstimate.leadLag && selectedLeadLagContribution !== undefined
+      ? {
+          ...probabilityEstimate.leadLag,
+          probabilityDelta: selectedLeadLagContribution,
+          scoreContribution: Number((selectedLeadLagContribution / overlayScoreDenominator).toFixed(6)),
+        }
+      : probabilityEstimate.leadLag;
   const chosenFairProb =
     coherenceAdjustment.yesFairProb === null
       ? null
@@ -3535,6 +3635,22 @@ function candidateFromMarket(
   rationale.push(
     `Model pipeline: ${probabilityEstimate.probabilityTransform} mixture with ${probabilityEstimate.calibrationMethod.toLowerCase().replace("_", " ")} calibration. Raw ${(chosenRawModelProb * 100).toFixed(2)}% -> calibrated ${(chosenModelProb * 100).toFixed(2)}%.`,
   );
+  if (probabilityEstimate.overlaylessRawModelProb !== undefined) {
+    const selectedOverlaylessProb = chosenSide === "YES" ? overlaylessModelProb : 1 - overlaylessModelProb;
+    rationale.push(
+      `Overlay-free selected-side baseline ${(selectedOverlaylessProb * 100).toFixed(2)}%; overlays moved the selected side by ${((chosenModelProb - selectedOverlaylessProb) * 100).toFixed(2)} pts.`,
+    );
+  }
+  if (silentClockContribution?.probabilityDelta) {
+    rationale.push(
+      `Silent-clock overlay contribution ${(silentClockContribution.probabilityDelta * 100).toFixed(2)} pts to selected-side probability and ${(silentClockContribution.scoreContribution ?? 0).toFixed(5)} to capital-time score.`,
+    );
+  }
+  if (leadLagContribution?.probabilityDelta) {
+    rationale.push(
+      `Lead-lag overlay contribution ${(leadLagContribution.probabilityDelta * 100).toFixed(2)} pts to selected-side probability and ${(leadLagContribution.scoreContribution ?? 0).toFixed(5)} to capital-time score.`,
+    );
+  }
   rationale.push(
     `Net alpha $${netAlphaUsd.toFixed(4)} = n(q-p) $${probabilityAlphaUsd.toFixed(4)} - fees $${feeEstimate.totalUsd.toFixed(4)} + incentives $${incentiveEstimate.totalUsd.toFixed(4)} + coherence $${coherenceUsd.toFixed(4)} + execution alpha $${executionAlphaUsd.toFixed(4)}.`,
   );
@@ -3740,8 +3856,8 @@ function candidateFromMarket(
     uncertaintyWidth: Number(uncertaintyWidth.toFixed(6)),
     toxicityScore: Number(executionAlpha.toxicityScore.toFixed(6)),
     riskCluster,
-    silentClock: probabilityEstimate.silentClock ?? undefined,
-    leadLag: probabilityEstimate.leadLag ?? undefined,
+    silentClock: silentClockContribution ?? undefined,
+    leadLag: leadLagContribution ?? undefined,
     executionPlan: {
       limitPriceCents: probabilityToCents(executionPrice),
       patienceHours: Number(executionAlpha.patienceHours.toFixed(2)),

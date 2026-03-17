@@ -116,6 +116,25 @@ interface CounterfactualAccumulator {
   divergenceCount: number;
 }
 
+interface OverlayAccumulator {
+  decisions: number;
+  placed: number;
+  probabilityContributionSum: number;
+  probabilityContributionCount: number;
+  scoreContributionSum: number;
+  scoreContributionCount: number;
+  executionAdjustedEdgeSum: number;
+  executionAdjustedEdgeCount: number;
+  markout30sSum: number;
+  markout30sCount: number;
+  markoutExpirySum: number;
+  markoutExpiryCount: number;
+  expiryPnlUsdSum: number;
+  expiryPnlUsdCount: number;
+  toxicityOverlap: number;
+  clusterStressOverlap: number;
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
@@ -469,6 +488,77 @@ function finalizeBuckets(map: Map<string, BucketAccumulator>, limit: number) {
     .slice(0, limit);
 }
 
+function createOverlayAccumulator(): OverlayAccumulator {
+  return {
+    decisions: 0,
+    placed: 0,
+    probabilityContributionSum: 0,
+    probabilityContributionCount: 0,
+    scoreContributionSum: 0,
+    scoreContributionCount: 0,
+    executionAdjustedEdgeSum: 0,
+    executionAdjustedEdgeCount: 0,
+    markout30sSum: 0,
+    markout30sCount: 0,
+    markoutExpirySum: 0,
+    markoutExpiryCount: 0,
+    expiryPnlUsdSum: 0,
+    expiryPnlUsdCount: 0,
+    toxicityOverlap: 0,
+    clusterStressOverlap: 0,
+  };
+}
+
+function applyOverlaySample(args: {
+  accumulator: OverlayAccumulator;
+  trade: ExecutionAttributionTrade;
+  probabilityContribution: number | null | undefined;
+  scoreContribution: number | null | undefined;
+}) {
+  args.accumulator.decisions += 1;
+  if (args.trade.executionStatus === "PLACED") args.accumulator.placed += 1;
+  if (typeof args.probabilityContribution === "number" && Number.isFinite(args.probabilityContribution)) {
+    args.accumulator.probabilityContributionSum += args.probabilityContribution;
+    args.accumulator.probabilityContributionCount += 1;
+  }
+  if (typeof args.scoreContribution === "number" && Number.isFinite(args.scoreContribution)) {
+    args.accumulator.scoreContributionSum += args.scoreContribution;
+    args.accumulator.scoreContributionCount += 1;
+  }
+  if (typeof args.trade.executionAdjustedEdge === "number" && Number.isFinite(args.trade.executionAdjustedEdge)) {
+    args.accumulator.executionAdjustedEdgeSum += args.trade.executionAdjustedEdge;
+    args.accumulator.executionAdjustedEdgeCount += 1;
+  }
+  if (typeof args.trade.markout30s === "number" && Number.isFinite(args.trade.markout30s)) {
+    args.accumulator.markout30sSum += args.trade.markout30s;
+    args.accumulator.markout30sCount += 1;
+  }
+  if (typeof args.trade.markoutExpiry === "number" && Number.isFinite(args.trade.markoutExpiry)) {
+    args.accumulator.markoutExpirySum += args.trade.markoutExpiry;
+    args.accumulator.markoutExpiryCount += 1;
+    args.accumulator.expiryPnlUsdSum += args.trade.markoutExpiry * Math.max(0, args.trade.filledContracts);
+    args.accumulator.expiryPnlUsdCount += 1;
+  }
+  if ((args.trade.toxicityScore ?? 0) >= 0.45) args.accumulator.toxicityOverlap += 1;
+  if (args.trade.clusterStress) args.accumulator.clusterStressOverlap += 1;
+}
+
+function finalizeOverlayAccumulator(accumulator: OverlayAccumulator) {
+  return {
+    decisions: accumulator.decisions,
+    placed: accumulator.placed,
+    fillRate: average(accumulator.placed, accumulator.decisions),
+    avgProbabilityContribution: average(accumulator.probabilityContributionSum, accumulator.probabilityContributionCount),
+    avgScoreContribution: average(accumulator.scoreContributionSum, accumulator.scoreContributionCount),
+    avgExecutionAdjustedEdge: average(accumulator.executionAdjustedEdgeSum, accumulator.executionAdjustedEdgeCount),
+    avgMarkout30s: average(accumulator.markout30sSum, accumulator.markout30sCount),
+    avgMarkoutExpiry: average(accumulator.markoutExpirySum, accumulator.markoutExpiryCount),
+    avgExpiryPnlUsd: average(accumulator.expiryPnlUsdSum, accumulator.expiryPnlUsdCount),
+    toxicityOverlapRate: average(accumulator.toxicityOverlap, accumulator.decisions),
+    clusterStressOverlapRate: average(accumulator.clusterStressOverlap, accumulator.decisions),
+  };
+}
+
 function resolveOrderId(
   decision: StoredCandidateDecisionEvent,
   ordersByClientOrderId: Map<string, StoredKalshiOrderEvent>,
@@ -756,11 +846,18 @@ export function summarizeExecutionAttribution({
   const byUncertainty = new Map<string, BucketAccumulator>();
   const byToxicity = new Map<string, BucketAccumulator>();
   const byBootstrap = new Map<string, BucketAccumulator>();
+  const silentClockOverlay = createOverlayAccumulator();
+  const leadLagOverlay = createOverlayAccumulator();
   const falseNegativesByExpert = new Map<string, CounterfactualAccumulator>();
   const falseNegativesByCluster = new Map<string, CounterfactualAccumulator>();
   const falseNegativesByToxicity = new Map<string, CounterfactualAccumulator>();
   const totals = createAccumulator("totals", "Totals");
   const trades: ExecutionAttributionTrade[] = [];
+  const executedClusterCounts = new Map<string, number>();
+  for (const event of executedDecisions) {
+    const cluster = event.payload.riskCluster ?? `${event.payload.category}:${event.payload.ticker}`;
+    executedClusterCounts.set(cluster, (executedClusterCounts.get(cluster) ?? 0) + 1);
+  }
 
   for (const event of executedDecisions) {
     const decision = event.payload;
@@ -780,6 +877,8 @@ export function summarizeExecutionAttribution({
       markoutsByFillId,
       balances,
     });
+    const cluster = decision.riskCluster ?? `${decision.category}:${decision.ticker}`;
+    const clusterStress = (executedClusterCounts.get(cluster) ?? 0) >= 2;
 
     const trade: ExecutionAttributionTrade = {
       recordedAt: event.recordedAt,
@@ -793,7 +892,7 @@ export function summarizeExecutionAttribution({
       dominantExpertWeight: roundNullable(dominantExpert.weight),
       probabilityTransform: decision.probabilityTransform,
       calibrationMethod: decision.calibrationMethod,
-      cluster: decision.riskCluster ?? `${decision.category}:${decision.ticker}`,
+      cluster,
       bootstrapMode,
       executionHealthRegime,
       uncertaintyBucket: uncertaintyLabel,
@@ -812,6 +911,11 @@ export function summarizeExecutionAttribution({
       inventorySkew: roundNullable(decision.executionPlan?.inventorySkew, 6),
       staleHazard: roundNullable(decision.executionPlan?.staleHazard, 6),
       quoteWidening: roundNullable(decision.executionPlan?.quoteWidening, 6),
+      silentClockProbabilityContribution: roundNullable(decision.silentClock?.probabilityDelta, 6),
+      silentClockScoreContribution: roundNullable(decision.silentClock?.scoreContribution, 6),
+      leadLagProbabilityContribution: roundNullable(decision.leadLag?.probabilityDelta, 6),
+      leadLagScoreContribution: roundNullable(decision.leadLag?.scoreContribution, 6),
+      clusterStress,
       limitPriceCents: decision.limitPriceCents,
       executionRole: decision.executionPlan?.role,
       fillProbability: roundNullable(decision.executionPlan?.fillProbability),
@@ -841,6 +945,22 @@ export function summarizeExecutionAttribution({
     pushBucket(byUncertainty, uncertaintyLabel, uncertaintyLabel, trade);
     pushBucket(byToxicity, toxicityLabel, toxicityLabel, trade);
     pushBucket(byBootstrap, bootstrapMode, bootstrapMode, trade);
+    if (decision.silentClock) {
+      applyOverlaySample({
+        accumulator: silentClockOverlay,
+        trade,
+        probabilityContribution: decision.silentClock.probabilityDelta,
+        scoreContribution: decision.silentClock.scoreContribution,
+      });
+    }
+    if (decision.leadLag) {
+      applyOverlaySample({
+        accumulator: leadLagOverlay,
+        trade,
+        probabilityContribution: decision.leadLag.probabilityDelta,
+        scoreContribution: decision.leadLag.scoreContribution,
+      });
+    }
   }
 
   const placedExecutedKeys = new Set(
@@ -1278,6 +1398,8 @@ export function summarizeExecutionAttribution({
         leadLagPayloads.reduce((sum, overlay) => sum + overlay.signalMagnitude, 0),
         leadLagPayloads.length,
       ),
+      silentClockPerformance: finalizeOverlayAccumulator(silentClockOverlay),
+      leadLagPerformance: finalizeOverlayAccumulator(leadLagOverlay),
       recentSilentClock: silentClockPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
       recentLeadLag: leadLagPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
     },

@@ -890,6 +890,10 @@ export function PredictionAutomationPanel() {
                       <p className="text-[11px] text-slate-300">
                         Avg decay {formatPercent(attribution.overlays?.avgSilentClockPenalty)} | Avg lag {formatPercent(attribution.overlays?.avgLeadLagSignal)}
                       </p>
+                      <p className="text-[11px] text-slate-300">
+                        Silent score {formatNumber(attribution.overlays?.silentClockPerformance.avgScoreContribution, 4)} | Lag score{" "}
+                        {formatNumber(attribution.overlays?.leadLagPerformance.avgScoreContribution, 4)}
+                      </p>
                     </div>
                   </div>
 
@@ -926,7 +930,9 @@ export function PredictionAutomationPanel() {
                           {trade.ticker} {trade.side} | {trade.executionStatus} | {trade.dominantExpert} | {trade.executionHealthRegime} |{" "}
                           {trade.bootstrapMode} | edge {formatPercent(trade.edge)} | exec {formatPercent(trade.executionAdjustedEdge)} | 30s{" "}
                           {formatPercent(trade.markout30s)} | expiry {formatPercent(trade.markoutExpiry)} | tox {formatPercent(trade.toxicityScore)} |{" "}
-                          uncert {formatPercent(trade.uncertaintyWidth)} | inv {formatNumber(trade.inventorySkew)} | cash {formatUsd(
+                          uncert {formatPercent(trade.uncertaintyWidth)} | inv {formatNumber(trade.inventorySkew)} | silent{" "}
+                          {formatPercent(trade.silentClockProbabilityContribution)} | lag {formatPercent(trade.leadLagProbabilityContribution)} | cluster{" "}
+                          {trade.clusterStress ? "stressed" : "normal"} | cash {formatUsd(
                             trade.actualCashDeltaUsd,
                           )} | drift {formatUsd(trade.cashDeltaDriftUsd)} | fee {formatUsd(trade.inferredActualFeeUsd)}
                         </p>
@@ -1176,16 +1182,45 @@ export function PredictionAutomationPanel() {
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
                   <p className="mb-2 text-[11px] font-semibold text-sky-200">Recent Signal Overlays</p>
                   {attribution.overlays && (attribution.overlays.recentSilentClock.length || attribution.overlays.recentLeadLag.length) ? (
-                    <div className="space-y-1">
+                    <div className="space-y-2">
+                      <div className="rounded border border-slate-800 bg-slate-950/60 p-2">
+                        <p className="text-[11px] text-slate-400">Silent-Clock Performance</p>
+                        <p className="mt-1 text-[11px] text-slate-300">
+                          Fill {formatPercent(attribution.overlays.silentClockPerformance.fillRate)} | Score{" "}
+                          {formatNumber(attribution.overlays.silentClockPerformance.avgScoreContribution, 4)} | 30s{" "}
+                          {formatPercent(attribution.overlays.silentClockPerformance.avgMarkout30s)} | Expiry{" "}
+                          {formatPercent(attribution.overlays.silentClockPerformance.avgMarkoutExpiry)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          Expiry PnL {formatUsd(attribution.overlays.silentClockPerformance.avgExpiryPnlUsd)} | Toxic overlap{" "}
+                          {formatPercent(attribution.overlays.silentClockPerformance.toxicityOverlapRate)} | Cluster overlap{" "}
+                          {formatPercent(attribution.overlays.silentClockPerformance.clusterStressOverlapRate)}
+                        </p>
+                      </div>
+                      <div className="rounded border border-slate-800 bg-slate-950/60 p-2">
+                        <p className="text-[11px] text-slate-400">Lead-Lag Performance</p>
+                        <p className="mt-1 text-[11px] text-slate-300">
+                          Fill {formatPercent(attribution.overlays.leadLagPerformance.fillRate)} | Score{" "}
+                          {formatNumber(attribution.overlays.leadLagPerformance.avgScoreContribution, 4)} | 30s{" "}
+                          {formatPercent(attribution.overlays.leadLagPerformance.avgMarkout30s)} | Expiry{" "}
+                          {formatPercent(attribution.overlays.leadLagPerformance.avgMarkoutExpiry)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          Expiry PnL {formatUsd(attribution.overlays.leadLagPerformance.avgExpiryPnlUsd)} | Toxic overlap{" "}
+                          {formatPercent(attribution.overlays.leadLagPerformance.toxicityOverlapRate)} | Cluster overlap{" "}
+                          {formatPercent(attribution.overlays.leadLagPerformance.clusterStressOverlapRate)}
+                        </p>
+                      </div>
                       {attribution.overlays.recentSilentClock.map((overlay, index) => (
                         <p key={uniqueRowKey(["silent", overlay.checkpointProgress, overlay.decayPenalty], index)} className="text-[11px] text-slate-300">
-                          Silent clock | checkpoint {formatPercent(overlay.checkpointProgress)} | penalty {formatPercent(overlay.decayPenalty)} |{" "}
-                          {overlay.rationale}
+                          Silent clock | checkpoint {formatPercent(overlay.checkpointProgress)} | penalty {formatPercent(overlay.decayPenalty)} | contrib{" "}
+                          {formatPercent(overlay.probabilityDelta)} | score {formatNumber(overlay.scoreContribution, 4)} | {overlay.rationale}
                         </p>
                       ))}
                       {attribution.overlays.recentLeadLag.map((overlay, index) => (
                         <p key={uniqueRowKey(["leadlag", overlay.leadTicker, overlay.lagTicker, overlay.signalMagnitude], index)} className="text-[11px] text-slate-300">
-                          Lead-lag {overlay.leadTicker} -&gt; {overlay.lagTicker} | signal {formatPercent(overlay.signalMagnitude)} | conf{" "}
+                          Lead-lag {overlay.leadTicker} -&gt; {overlay.lagTicker} | signal {formatPercent(overlay.signalMagnitude)} | contrib{" "}
+                          {formatPercent(overlay.probabilityDelta)} | score {formatNumber(overlay.scoreContribution, 4)} | conf{" "}
                           {formatPercent(overlay.confidence)}
                         </p>
                       ))}

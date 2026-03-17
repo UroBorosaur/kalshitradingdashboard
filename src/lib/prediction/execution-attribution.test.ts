@@ -585,6 +585,8 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
           checkpointProgress: 0.62,
           decayPenalty: 0.03,
           adjustedProbability: 0.46,
+          probabilityDelta: -0.02,
+          scoreContribution: -0.0012,
           rationale: "No confirming event arrived by checkpoint.",
         },
         leadLag: {
@@ -595,6 +597,8 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
           confidence: 0.5,
           direction: "UP",
           adjustedProbability: 0.5,
+          probabilityDelta: 0.01,
+          scoreContribution: 0.0008,
           rationale: "Related market repriced first.",
         },
       },
@@ -680,4 +684,6 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.liquidation?.flatten, 1);
   assert.equal(summary.overlays?.silentClockCount, 1);
   assert.equal(summary.overlays?.leadLagCount, 1);
+  assert.equal(summary.overlays?.silentClockPerformance.decisions, 0);
+  assert.equal(summary.overlays?.leadLagPerformance.decisions, 0);
 });
