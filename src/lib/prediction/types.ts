@@ -253,6 +253,30 @@ export interface PortfolioRanking {
   }>;
 }
 
+export type ShadowBaselineProfile =
+  | "CURRENT_MAKER"
+  | "SMART_TAKER"
+  | "MAKER_NO_TOXICITY"
+  | "MAKER_NO_CLUSTER_CAP";
+
+export interface ShadowBaselineSummary {
+  profile: ShadowBaselineProfile;
+  label: string;
+  description: string;
+  candidateCount: number;
+  actionables: number;
+  plannedStakeUsd: number;
+  avgExecutionAdjustedEdge: number | null;
+  expectedNetAlphaUsd: number | null;
+  expectedNetMarkoutAfterFeesUsd: number | null;
+  expectedExpiryPnlUsd: number | null;
+  fillRateEstimate: number | null;
+  cancellationRateEstimate: number | null;
+  adverseSelectionRate: number | null;
+  topTickers: string[];
+  notes: string[];
+}
+
 export interface AutomationRunSummary {
   mode: AutomationMode;
   executed: boolean;
@@ -264,6 +288,7 @@ export interface AutomationRunSummary {
   totalStakePlacedUsd: number;
   candidates: PredictionCandidate[];
   portfolioRanking?: PortfolioRanking;
+  shadowBaselines?: ShadowBaselineSummary[];
   warnings: string[];
   inferredRegime: {
     label: string;

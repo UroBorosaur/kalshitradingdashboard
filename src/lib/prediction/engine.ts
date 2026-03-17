@@ -21,7 +21,7 @@ import {
   snapProbabilityToMarket,
 } from "@/lib/prediction/fixed-point";
 import { refreshMarkoutTelemetry } from "@/lib/prediction/markouts";
-import { persistCandidateDecisions, persistKalshiBalanceSnapshot, persistMarketScan } from "@/lib/storage/prediction-store";
+import { persistCandidateDecisions, persistKalshiBalanceSnapshot, persistMarketScan, persistShadowBaselines } from "@/lib/storage/prediction-store";
 import {
   entmaxBisect,
   logit,
@@ -48,6 +48,8 @@ import type {
   PredictionMarketQuote,
   PredictionSide,
   ProbabilityTransform,
+  ShadowBaselineSummary,
+  ShadowBaselineProfile,
   StrategicBreakdown,
   StrategyTag,
   KalshiPositionLite,
@@ -428,6 +430,15 @@ interface ExecutionHealthContext {
   scorePenalty: number;
   regime: ExecutionHealthRegime;
   warnings: string[];
+}
+
+interface PortfolioSizingOptions {
+  disableClusterCap?: boolean;
+  toxicityWeightScale?: number;
+}
+
+interface ActionableCandidateOptions {
+  ignoreToxicityGate?: boolean;
 }
 
 const REQUIRED_PRIVATE_STREAM_CHANNELS = ["user_orders", "fill", "market_positions", "order_group_updates"] as const;
@@ -3764,11 +3775,178 @@ function candidateRiskBucket(category: PredictionCategory) {
   return "OTHER";
 }
 
+function normalizeShadowBaselineCandidate(
+  candidate: PredictionCandidate,
+  profile: ShadowBaselineProfile,
+): PredictionCandidate {
+  if (profile !== "SMART_TAKER") return candidate;
+
+  const currentFillProbability = candidate.executionPlan?.fillProbability ?? 0.55;
+  const currentFeeUsd = candidate.executionPlan?.feeUsd ?? candidate.feeEstimateUsd ?? 0;
+  const takerPenaltyPerContract =
+    0.003 +
+    Math.max(0, candidate.toxicityScore ?? 0) * 0.004 +
+    Math.max(0, candidate.uncertaintyWidth ?? 0) * 0.025 +
+    Math.max(0, 1 - currentFillProbability) * 0.002;
+  const contracts = Math.max(candidateContractStep(candidate), candidate.recommendedContracts);
+  const price = Math.max(0.01, candidate.limitPriceCents / 100);
+  const adjustedExecutionEdge = (candidate.edge ?? 0) - takerPenaltyPerContract;
+  const adjustedPerDollar = (candidate.expectedValuePerDollarRisked ?? 0) - takerPenaltyPerContract / Math.max(price, 0.01);
+  const adjustedNetAlpha =
+    (candidate.netAlphaUsd ?? candidate.expectedValuePerContract * contracts) -
+    Math.max(0, candidate.executionAlphaUsd ?? 0) -
+    takerPenaltyPerContract * contracts -
+    currentFeeUsd * 0.15;
+
+  return {
+    ...candidate,
+    executionAdjustedEdge: Number(adjustedExecutionEdge.toFixed(6)),
+    expectedValuePerDollarRisked: Number(adjustedPerDollar.toFixed(6)),
+    netAlphaUsd: Number(adjustedNetAlpha.toFixed(4)),
+    executionAlphaUsd: Number((-takerPenaltyPerContract * contracts).toFixed(4)),
+    executionPlan: candidate.executionPlan
+      ? {
+          ...candidate.executionPlan,
+          role: "TAKER",
+          fillProbability: 0.995,
+          patienceHours: 0.01,
+          expectedExecutionValueUsd: Number((-takerPenaltyPerContract * contracts).toFixed(4)),
+          feeUsd: Number((currentFeeUsd * 1.15).toFixed(4)),
+          quoteWidening: 0,
+          staleHazard: 0,
+        }
+      : {
+          limitPriceCents: candidate.limitPriceCents,
+          patienceHours: 0.01,
+          fillProbability: 0.995,
+          expectedExecutionValueUsd: Number((-takerPenaltyPerContract * contracts).toFixed(4)),
+          feeUsd: Number((currentFeeUsd * 1.15).toFixed(4)),
+          role: "TAKER",
+          quoteWidening: 0,
+          staleHazard: 0,
+          inventorySkew: 0,
+        },
+  };
+}
+
+function summarizeShadowBaseline(
+  profile: ShadowBaselineProfile,
+  description: string,
+  candidates: PredictionCandidate[],
+  actionable: PredictionCandidate[],
+): ShadowBaselineSummary {
+  const fillRates = actionable
+    .map((candidate) => candidate.executionPlan?.fillProbability)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const executionAdjustedEdges = actionable
+    .map((candidate) => candidate.executionAdjustedEdge ?? candidate.edge)
+    .filter((value): value is number => Number.isFinite(value));
+  const expectedNetAlpha = actionable
+    .map((candidate) => candidate.netAlphaUsd ?? candidate.expectedValuePerContract * candidate.recommendedContracts)
+    .filter((value): value is number => Number.isFinite(value));
+  const netMarkoutAfterFees = actionable
+    .map((candidate) => (candidate.executionAlphaUsd ?? candidate.executionPlan?.expectedExecutionValueUsd ?? 0) - (candidate.executionPlan?.feeUsd ?? candidate.feeEstimateUsd ?? 0))
+    .filter((value): value is number => Number.isFinite(value));
+  const adverseSelectionRates = actionable
+    .map((candidate) => {
+      const toxicity = Math.max(0, candidate.toxicityScore ?? 0);
+      const rolePenalty = candidate.executionPlan?.role === "TAKER" ? 0.08 : 0;
+      return clamp(toxicity + rolePenalty, 0, 1);
+    })
+    .filter((value): value is number => Number.isFinite(value));
+  const labelByProfile: Record<ShadowBaselineProfile, string> = {
+    CURRENT_MAKER: "Current Maker",
+    SMART_TAKER: "Old Smart Taker",
+    MAKER_NO_TOXICITY: "Maker w/o Toxicity Gate",
+    MAKER_NO_CLUSTER_CAP: "Maker w/o Cluster Caps",
+  };
+
+  return {
+    profile,
+    label: labelByProfile[profile],
+    description,
+    candidateCount: candidates.length,
+    actionables: actionable.length,
+    plannedStakeUsd: Number(actionable.reduce((sum, candidate) => sum + candidate.recommendedStakeUsd, 0).toFixed(4)),
+    avgExecutionAdjustedEdge: executionAdjustedEdges.length ? Number(average(executionAdjustedEdges).toFixed(6)) : null,
+    expectedNetAlphaUsd: expectedNetAlpha.length ? Number(expectedNetAlpha.reduce((sum, value) => sum + value, 0).toFixed(4)) : null,
+    expectedNetMarkoutAfterFeesUsd: netMarkoutAfterFees.length ? Number(netMarkoutAfterFees.reduce((sum, value) => sum + value, 0).toFixed(4)) : null,
+    expectedExpiryPnlUsd: expectedNetAlpha.length ? Number(expectedNetAlpha.reduce((sum, value) => sum + value, 0).toFixed(4)) : null,
+    fillRateEstimate: fillRates.length ? Number(average(fillRates).toFixed(6)) : null,
+    cancellationRateEstimate: fillRates.length ? Number(average(fillRates.map((value) => 1 - value)).toFixed(6)) : null,
+    adverseSelectionRate: adverseSelectionRates.length ? Number(average(adverseSelectionRates).toFixed(6)) : null,
+    topTickers: actionable
+      .slice()
+      .sort((a, b) => (b.executionAdjustedEdge ?? b.edge) - (a.executionAdjustedEdge ?? a.edge))
+      .slice(0, 4)
+      .map((candidate) => candidate.ticker),
+    notes: [
+      `Compared on the same diversified candidate universe (${candidates.length} candidates).`,
+      `Actionable set size ${actionable.length} with planned stake $${actionable.reduce((sum, candidate) => sum + candidate.recommendedStakeUsd, 0).toFixed(2)}.`,
+    ],
+  };
+}
+
+function buildShadowBaselineSummaries(args: {
+  mode: AutomationMode;
+  selected: PredictionCandidate[];
+  planned: PredictionCandidate[];
+  actionable: PredictionCandidate[];
+  maxDailyRiskUsd: number;
+}): ShadowBaselineSummary[] {
+  const { mode, selected, planned, actionable, maxDailyRiskUsd } = args;
+  const currentMaker = summarizeShadowBaseline(
+    "CURRENT_MAKER",
+    "Current bounded log-odds maker with toxicity and cluster controls active.",
+    planned,
+    actionable,
+  );
+  const smartTakerCandidates = selected.map((candidate) => normalizeShadowBaselineCandidate(candidate, "SMART_TAKER"));
+  const smartTakerPlanned = applyPortfolioSizing(smartTakerCandidates, maxDailyRiskUsd, mode, {
+    disableClusterCap: false,
+    toxicityWeightScale: 0.65,
+  });
+  const smartTaker = summarizeShadowBaseline(
+    "SMART_TAKER",
+    "Legacy-style taker profile with immediate fills and weaker queue discipline.",
+    smartTakerPlanned,
+    actionableCandidates(smartTakerPlanned, mode, { ignoreToxicityGate: true }),
+  );
+  const makerNoToxicityPlanned = applyPortfolioSizing(selected, maxDailyRiskUsd, mode, {
+    disableClusterCap: false,
+    toxicityWeightScale: 0,
+  });
+  const makerNoToxicity = summarizeShadowBaseline(
+    "MAKER_NO_TOXICITY",
+    "Current maker profile with toxicity penalty removed from sizing and gating.",
+    makerNoToxicityPlanned,
+    actionableCandidates(makerNoToxicityPlanned, mode, { ignoreToxicityGate: true }),
+  );
+  const makerNoClusterCapPlanned = applyPortfolioSizing(selected, maxDailyRiskUsd, mode, {
+    disableClusterCap: true,
+    toxicityWeightScale: 1,
+  });
+  const makerNoClusterCap = summarizeShadowBaseline(
+    "MAKER_NO_CLUSTER_CAP",
+    "Current maker profile with cluster concentration caps disabled.",
+    makerNoClusterCapPlanned,
+    actionableCandidates(makerNoClusterCapPlanned, mode),
+  );
+
+  return [currentMaker, smartTaker, makerNoToxicity, makerNoClusterCap];
+}
+
 // `estimateCandidateMoments` moved to the top of the file for visibility in `candidateUtilityScore`.
 
-function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd: number, mode: AutomationMode): PredictionCandidate[] {
+function applyPortfolioSizing(
+  candidates: PredictionCandidate[],
+  maxDailyRiskUsd: number,
+  mode: AutomationMode,
+  options?: PortfolioSizingOptions,
+): PredictionCandidate[] {
   const rules = MODE_RULES[mode];
   const clusterStakeLimitUsd = maxDailyRiskUsd * CLUSTER_LIMIT_SHARE_BY_MODE[mode];
+  const toxicityWeightScale = options?.toxicityWeightScale ?? 1;
   const buyPriority = [...candidates]
     .map((candidate, index) => ({ candidate, index }))
     .sort((a, b) => {
@@ -3850,7 +4028,7 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
     const clusterKey = candidate.riskCluster ?? candidate.category;
     const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
     if (unitStake > riskRemaining) continue;
-    if (clusterStake + unitStake > clusterStakeLimitUsd) {
+    if (!options?.disableClusterCap && clusterStake + unitStake > clusterStakeLimitUsd) {
       clusterCapMissByKey.set(
         candidateKey(candidate),
         Math.max(clusterCapMissByKey.get(candidateKey(candidate)) ?? 0, clusterStake + unitStake - clusterStakeLimitUsd),
@@ -3903,7 +4081,7 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
       const clusterKey = candidate.riskCluster ?? candidate.category;
       const clusterStake = allocatedStakeByCluster.get(clusterKey) ?? 0;
       if (unitStake > riskRemaining) continue;
-      if (clusterStake + unitStake > clusterStakeLimitUsd) {
+      if (!options?.disableClusterCap && clusterStake + unitStake > clusterStakeLimitUsd) {
         clusterCapMissByKey.set(
           candidateKey(candidate),
           Math.max(clusterCapMissByKey.get(key) ?? 0, clusterStake + unitStake - clusterStakeLimitUsd),
@@ -3925,7 +4103,7 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
           (candidate.executionAdjustedEdge ?? 0) * 0.35
         ) *
         gapBoost /
-        (diminishing * (1 + Math.max(0, candidate.toxicityScore ?? 0) * 0.9));
+        (diminishing * (1 + Math.max(0, candidate.toxicityScore ?? 0) * 0.9 * toxicityWeightScale));
 
       if (marginal > bestMarginal) {
         bestMarginal = marginal;
@@ -3995,14 +4173,18 @@ function applyPortfolioSizing(candidates: PredictionCandidate[], maxDailyRiskUsd
   return out;
 }
 
-function actionableCandidates(planned: PredictionCandidate[], mode: AutomationMode): PredictionCandidate[] {
+function actionableCandidates(
+  planned: PredictionCandidate[],
+  mode: AutomationMode,
+  options?: ActionableCandidateOptions,
+): PredictionCandidate[] {
   return planned.filter(
     (candidate) =>
       candidate.recommendedContracts > 0 &&
       candidate.recommendedStakeUsd > 0 &&
       candidate.expectedValuePerDollarRisked > 0 &&
       (candidate.executionAdjustedEdge ?? candidate.edge) > 0 &&
-      (candidate.toxicityScore ?? 0) < 0.9 &&
+      (options?.ignoreToxicityGate || (candidate.toxicityScore ?? 0) < 0.9) &&
       (candidate.compositeScore ?? -1) > SCORE_THRESHOLD_BY_MODE[mode] &&
       isBuyVerdict(candidate.verdict),
   );
@@ -4600,6 +4782,21 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     executionHealthRegime: executionHealth.regime,
     executionHealthPenalty: Number(executionHealth.markoutPenalty.toFixed(6)),
   };
+  const shadowBaselines = buildShadowBaselineSummaries({
+    mode,
+    selected,
+    planned: executionQueue,
+    actionable,
+    maxDailyRiskUsd,
+  });
+  await persistShadowBaselines({
+    runId,
+    mode,
+    baselines: shadowBaselines,
+    source: "automation/shadow-baselines",
+  }).catch(() => {
+    warnings.push("Storage warning: failed to persist shadow baseline comparisons.");
+  });
 
   function withRuntimeGateDiagnostics(candidate: PredictionCandidate): CandidateGateDiagnostic[] {
     return upsertGateDiagnostic(candidate.gateDiagnostics, {
@@ -4814,6 +5011,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     totalStakePlacedUsd: Number(executedStake.toFixed(2)),
     candidates: executedCandidates,
     portfolioRanking,
+    shadowBaselines,
     warnings,
     inferredRegime,
     controls,

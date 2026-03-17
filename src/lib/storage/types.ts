@@ -10,6 +10,7 @@ import type {
   PredictionCandidate,
   PredictionCategory,
   ProbabilityTransform,
+  ShadowBaselineProfile,
 } from "@/lib/prediction/types";
 
 export type PredictionStorageLayer = "raw" | "derived";
@@ -22,6 +23,7 @@ export type PredictionStorageStream =
   | "quotes"
   | "orderbook_events"
   | "candidate_decisions"
+  | "shadow_baselines"
   | "resolutions"
   | "markouts";
 
@@ -211,6 +213,26 @@ export interface StoredResolutionEvent {
   resolvedAt?: string;
 }
 
+export interface StoredShadowBaselineEvent {
+  runId: string;
+  mode: AutomationMode;
+  profile: ShadowBaselineProfile;
+  label: string;
+  description: string;
+  candidateCount: number;
+  actionables: number;
+  plannedStakeUsd: number;
+  avgExecutionAdjustedEdge: number | null;
+  expectedNetAlphaUsd: number | null;
+  expectedNetMarkoutAfterFeesUsd: number | null;
+  expectedExpiryPnlUsd: number | null;
+  fillRateEstimate: number | null;
+  cancellationRateEstimate: number | null;
+  adverseSelectionRate: number | null;
+  topTickers: string[];
+  notes: string[];
+}
+
 export type MarkoutHorizonKey = "5s" | "30s" | "2m" | "10m" | "expiry";
 
 export interface StoredMarkoutEvent {
@@ -235,6 +257,7 @@ export interface PredictionReplayDay {
   quotes: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>;
   orderbookEvents: Array<PredictionStorageEnvelope<StoredOrderbookEvent>>;
   candidateDecisions: Array<PredictionStorageEnvelope<StoredCandidateDecisionEvent>>;
+  shadowBaselines: Array<PredictionStorageEnvelope<StoredShadowBaselineEvent>>;
   resolutions: Array<PredictionStorageEnvelope<StoredResolutionEvent>>;
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
@@ -248,6 +271,7 @@ export type PredictionReplayEvent =
   | PredictionStorageEnvelope<StoredKalshiQuoteEvent>
   | PredictionStorageEnvelope<StoredOrderbookEvent>
   | PredictionStorageEnvelope<StoredCandidateDecisionEvent>
+  | PredictionStorageEnvelope<StoredShadowBaselineEvent>
   | PredictionStorageEnvelope<StoredResolutionEvent>
   | PredictionStorageEnvelope<StoredMarkoutEvent>;
 

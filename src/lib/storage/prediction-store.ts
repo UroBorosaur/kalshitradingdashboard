@@ -24,9 +24,19 @@ import type {
   StoredMarkoutEvent,
   StoredOrderbookEvent,
   StoredResolutionEvent,
+  StoredShadowBaselineEvent,
 } from "@/lib/storage/types";
 import { toStoredCandidateDecisionPayload } from "@/lib/storage/types";
-import type { AutomationMode, KalshiFillLite, KalshiOrderLite, KalshiPositionLite, KalshiQuoteLite, PredictionCandidate, PredictionMarketQuote } from "@/lib/prediction/types";
+import type {
+  AutomationMode,
+  KalshiFillLite,
+  KalshiOrderLite,
+  KalshiPositionLite,
+  KalshiQuoteLite,
+  PredictionCandidate,
+  PredictionMarketQuote,
+  ShadowBaselineSummary,
+} from "@/lib/prediction/types";
 
 const SCHEMA_VERSION = 1;
 const STATE_NAME = "prediction-ingestion";
@@ -473,6 +483,42 @@ export async function persistCandidateDecisions(args: {
   await appendPredictionEvents("raw", "candidate_decisions", events);
 }
 
+export async function persistShadowBaselines(args: {
+  runId: string;
+  mode: AutomationMode;
+  baselines: ShadowBaselineSummary[];
+  source: string;
+}) {
+  const events = args.baselines.map((baseline) =>
+    makeEnvelope<StoredShadowBaselineEvent>(
+      "shadow_baselines",
+      "raw",
+      args.source,
+      `shadow:${args.runId}:${baseline.profile}`,
+      {
+        runId: args.runId,
+        mode: args.mode,
+        profile: baseline.profile,
+        label: baseline.label,
+        description: baseline.description,
+        candidateCount: baseline.candidateCount,
+        actionables: baseline.actionables,
+        plannedStakeUsd: baseline.plannedStakeUsd,
+        avgExecutionAdjustedEdge: baseline.avgExecutionAdjustedEdge,
+        expectedNetAlphaUsd: baseline.expectedNetAlphaUsd,
+        expectedNetMarkoutAfterFeesUsd: baseline.expectedNetMarkoutAfterFeesUsd,
+        expectedExpiryPnlUsd: baseline.expectedExpiryPnlUsd,
+        fillRateEstimate: baseline.fillRateEstimate,
+        cancellationRateEstimate: baseline.cancellationRateEstimate,
+        adverseSelectionRate: baseline.adverseSelectionRate,
+        topTickers: baseline.topTickers,
+        notes: baseline.notes,
+      },
+    ),
+  );
+  await appendPredictionEvents("raw", "shadow_baselines", events);
+}
+
 export async function persistStreamEvents(args: {
   source: string;
   events: StoredKalshiStreamEvent[];
@@ -513,6 +559,10 @@ export async function readStoredQuotesSince(sinceMs: number) {
   return readPredictionEventsSince<StoredKalshiQuoteEvent>("raw", "quotes", sinceMs);
 }
 
+export async function readStoredShadowBaselinesSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredShadowBaselineEvent>("raw", "shadow_baselines", sinceMs);
+}
+
 export async function readStoredResolutionsSince(sinceMs: number) {
   return readPredictionEventsSince<StoredResolutionEvent>("raw", "resolutions", sinceMs);
 }
@@ -543,6 +593,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     quotes,
     orderbookEvents,
     candidateDecisions,
+    shadowBaselines,
     resolutions,
     markouts,
   ] = await Promise.all([
@@ -554,6 +605,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     readPredictionEventsForDay<StoredKalshiQuoteEvent>("raw", "quotes", day),
     readPredictionEventsForDay<StoredOrderbookEvent>("raw", "orderbook_events", day),
     readPredictionEventsForDay<StoredCandidateDecisionEvent>("raw", "candidate_decisions", day),
+    readPredictionEventsForDay<StoredShadowBaselineEvent>("raw", "shadow_baselines", day),
     readPredictionEventsForDay<StoredResolutionEvent>("raw", "resolutions", day),
     readPredictionEventsForDay<StoredMarkoutEvent>("derived", "markouts", day),
   ]);
@@ -567,6 +619,7 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     quotes,
     orderbookEvents,
     candidateDecisions,
+    shadowBaselines,
     resolutions,
     markouts,
   };
@@ -581,8 +634,9 @@ const REPLAY_STREAM_ORDER: Record<PredictionReplayEvent["stream"], number> = {
   quotes: 5,
   orderbook_events: 6,
   candidate_decisions: 7,
-  resolutions: 8,
-  markouts: 9,
+  shadow_baselines: 8,
+  resolutions: 9,
+  markouts: 10,
 };
 
 function compareReplayEvents(a: PredictionReplayEvent, b: PredictionReplayEvent) {
@@ -611,6 +665,7 @@ export async function loadPredictionReplayTimeline(day: string): Promise<Predict
     ...replayDay.quotes,
     ...replayDay.orderbookEvents,
     ...replayDay.candidateDecisions,
+    ...replayDay.shadowBaselines,
     ...replayDay.resolutions,
     ...replayDay.markouts,
   ].sort(compareReplayEvents);

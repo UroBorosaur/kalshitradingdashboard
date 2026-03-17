@@ -604,6 +604,39 @@ export function PredictionAutomationPanel() {
               </div>
             )}
 
+            {summary.shadowBaselines?.length ? (
+              <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                <p className="mb-2 flex items-center gap-1 text-[11px] font-semibold text-sky-200">
+                  <Brain className="h-3.5 w-3.5" />
+                  Shadow Baselines
+                </p>
+                <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+                  {summary.shadowBaselines.map((baseline) => (
+                    <div key={baseline.profile} className="rounded-md border border-slate-800 bg-slate-950/60 p-2 text-[11px] text-slate-300">
+                      <p className="font-semibold text-slate-100">{baseline.label}</p>
+                      <p className="mt-1 text-slate-400">{baseline.description}</p>
+                      <p className="mt-2">
+                        Candidates {baseline.candidateCount} | Actionable {baseline.actionables}
+                      </p>
+                      <p>
+                        Stake {formatUsd(baseline.plannedStakeUsd)} | Fill {formatPercent(baseline.fillRateEstimate)}
+                      </p>
+                      <p>
+                        Net alpha {formatUsd(baseline.expectedNetAlphaUsd)} | Markout {formatUsd(baseline.expectedNetMarkoutAfterFeesUsd)}
+                      </p>
+                      <p>
+                        Expiry {formatUsd(baseline.expectedExpiryPnlUsd)} | Cancel {formatPercent(baseline.cancellationRateEstimate)}
+                      </p>
+                      <p>
+                        Adverse sel. {formatPercent(baseline.adverseSelectionRate)} | Exec edge {formatPercent(baseline.avgExecutionAdjustedEdge)}
+                      </p>
+                      <p className="mt-1 text-slate-400">Top: {baseline.topTickers.length ? baseline.topTickers.join(", ") : "none"}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
               <p className="mb-2 flex items-center gap-1 text-[11px] font-semibold text-sky-200">
                 <Brain className="h-3.5 w-3.5" />
