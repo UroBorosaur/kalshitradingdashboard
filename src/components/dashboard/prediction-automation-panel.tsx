@@ -276,6 +276,12 @@ function formatGateMiss(
   return `${value.toFixed(0)} lvl`;
 }
 
+function uniqueRowKey(parts: Array<string | number | null | undefined>, index: number) {
+  return `${parts
+    .map((part) => (part === null || part === undefined || part === "" ? "na" : String(part)))
+    .join(":")}:${index}`;
+}
+
 export function PredictionAutomationPanel() {
   const {
     mode,
@@ -528,9 +534,9 @@ export function PredictionAutomationPanel() {
 
             <div className="space-y-2">
               {summary.candidates.length ? (
-                summary.candidates.map((candidate) => (
+                summary.candidates.map((candidate, index) => (
                   <div
-                    key={`${candidate.ticker}-${candidate.side}`}
+                    key={uniqueRowKey([candidate.ticker, candidate.side, candidate.executionStatus, candidate.limitPriceCents], index)}
                     className="rounded-md border border-slate-800 bg-slate-900/70 p-2"
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -721,8 +727,8 @@ export function PredictionAutomationPanel() {
                   <ShieldAlert className="h-3.5 w-3.5" />
                   Warnings
                 </p>
-                {summary.warnings.map((warning) => (
-                  <p key={warning}>- {warning}</p>
+                {summary.warnings.map((warning, index) => (
+                  <p key={uniqueRowKey([warning], index)}>- {warning}</p>
                 ))}
               </div>
             ) : (
@@ -899,8 +905,8 @@ export function PredictionAutomationPanel() {
                       <div key={group.label} className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                         <p className="text-[11px] text-slate-400">{group.label}</p>
                         {group.rows.length ? (
-                          group.rows.map((row) => (
-                            <p key={`${group.label}-${row.key}`} className="mt-1 text-[11px] text-slate-300">
+                          group.rows.map((row, index) => (
+                            <p key={uniqueRowKey([group.label, row.key, row.label], index)} className="mt-1 text-[11px] text-slate-300">
                               {row.label} | {row.placed}/{row.decisions} placed | 30s {formatPercent(row.avgMarkout30s)} | expiry{" "}
                               {formatPercent(row.avgMarkoutExpiry)} | drift {formatUsd(row.avgCashDeltaDriftUsd)}
                             </p>
@@ -915,8 +921,8 @@ export function PredictionAutomationPanel() {
                   <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                     <p className="text-[11px] text-slate-400">Recent Trade Forensics</p>
                     {attribution.recentTrades.length ? (
-                      attribution.recentTrades.map((trade) => (
-                        <p key={`${trade.recordedAt}-${trade.ticker}-${trade.side}`} className="mt-1 text-[11px] text-slate-300">
+                      attribution.recentTrades.map((trade, index) => (
+                        <p key={uniqueRowKey([trade.recordedAt, trade.ticker, trade.side, trade.executionStatus], index)} className="mt-1 text-[11px] text-slate-300">
                           {trade.ticker} {trade.side} | {trade.executionStatus} | {trade.dominantExpert} | {trade.executionHealthRegime} |{" "}
                           {trade.bootstrapMode} | edge {formatPercent(trade.edge)} | exec {formatPercent(trade.executionAdjustedEdge)} | 30s{" "}
                           {formatPercent(trade.markout30s)} | expiry {formatPercent(trade.markoutExpiry)} | tox {formatPercent(trade.toxicityScore)} |{" "}
@@ -988,8 +994,8 @@ export function PredictionAutomationPanel() {
                             <div key={group.label} className="rounded border border-slate-800 bg-slate-900/60 p-2">
                               <p className="text-[11px] text-slate-400">{group.label}</p>
                               {group.rows.length ? (
-                                group.rows.map((row) => (
-                                  <p key={`${group.label}-${row.key}`} className="mt-1 text-[11px] text-slate-300">
+                                group.rows.map((row, index) => (
+                                  <p key={uniqueRowKey([group.label, row.key, row.label], index)} className="mt-1 text-[11px] text-slate-300">
                                     {row.label} | {row.profitable}/{row.resolved} profitable | hit {formatPercent(row.hitRate)} | avg{" "}
                                     {formatUsd(row.avgCounterfactualPnlUsd)} | total {formatUsd(row.totalCounterfactualPnlUsd)}
                                   </p>
@@ -1004,8 +1010,8 @@ export function PredictionAutomationPanel() {
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">Near-Miss Gates</p>
                           {attribution.selectionControl.byGate.length ? (
-                            attribution.selectionControl.byGate.map((gate) => (
-                              <p key={gate.gate} className="mt-1 text-[11px] text-slate-300">
+                            attribution.selectionControl.byGate.map((gate, index) => (
+                              <p key={uniqueRowKey([gate.gate, gate.label], index)} className="mt-1 text-[11px] text-slate-300">
                                 {gate.label} | {gate.count} candidates | avg miss {formatGateMiss(gate.avgMissBy, gate.unit)} | max miss{" "}
                                 {formatGateMiss(gate.maxMissBy, gate.unit)}
                               </p>
@@ -1018,8 +1024,8 @@ export function PredictionAutomationPanel() {
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">Gate Waterfall</p>
                           {attribution.selectionControl.gateWaterfall.length ? (
-                            attribution.selectionControl.gateWaterfall.map((gate) => (
-                              <p key={`waterfall-${gate.gate}`} className="mt-1 text-[11px] text-slate-300">
+                            attribution.selectionControl.gateWaterfall.map((gate, index) => (
+                              <p key={uniqueRowKey(["waterfall", gate.gate, gate.label], index)} className="mt-1 text-[11px] text-slate-300">
                                 {gate.label} | primary {gate.primaryCount} avg {formatGateMiss(gate.avgPrimaryMissBy, gate.unit)} | secondary{" "}
                                 {gate.secondaryCount} avg {formatGateMiss(gate.avgSecondaryMissBy, gate.unit)}
                               </p>
@@ -1032,8 +1038,8 @@ export function PredictionAutomationPanel() {
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">One-Gate Looser Simulation</p>
                           {attribution.selectionControl.counterfactualByGate.length ? (
-                            attribution.selectionControl.counterfactualByGate.map((gate) => (
-                              <p key={`counterfactual-${gate.gate}`} className="mt-1 text-[11px] text-slate-300">
+                            attribution.selectionControl.counterfactualByGate.map((gate, index) => (
+                              <p key={uniqueRowKey(["counterfactual", gate.gate, gate.label], index)} className="mt-1 text-[11px] text-slate-300">
                                 {gate.label} | {gate.looseningLabel} | impacted {gate.impactedCount} | extra passes {gate.additionalPasses} | hit{" "}
                                 {formatPercent(gate.conversionRate)}
                               </p>
@@ -1046,9 +1052,9 @@ export function PredictionAutomationPanel() {
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">Recent Near Misses</p>
                           {attribution.selectionControl.recentNearMisses.length ? (
-                            attribution.selectionControl.recentNearMisses.map((miss) => (
+                            attribution.selectionControl.recentNearMisses.map((miss, index) => (
                               <p
-                                key={`${miss.recordedAt}-${miss.ticker}-${miss.side}-${miss.source}`}
+                                key={uniqueRowKey([miss.recordedAt, miss.ticker, miss.side, miss.source, miss.verdict], index)}
                                 className="mt-1 text-[11px] text-slate-300"
                               >
                                 {miss.ticker} {miss.side} | {miss.source.replace("automation/", "")} | {miss.dominantExpert} |{" "}
@@ -1097,8 +1103,8 @@ export function PredictionAutomationPanel() {
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
                   <p className="mb-2 text-[11px] font-semibold text-sky-200">Recent Replacements</p>
                   {attribution.replacement?.recent.length ? (
-                    attribution.replacement.recent.map((decision) => (
-                      <p key={`${decision.candidateKey}-${decision.incumbentOrderId ?? decision.incumbentTicker}`} className="mt-1 text-[11px] text-slate-300">
+                    attribution.replacement.recent.map((decision, index) => (
+                      <p key={uniqueRowKey([decision.candidateKey, decision.incumbentOrderId, decision.incumbentTicker, decision.action], index)} className="mt-1 text-[11px] text-slate-300">
                         {decision.ticker} {decision.side} | {decision.action} | delta {formatNumber(decision.replacementScoreDelta, 4)} | cost{" "}
                         {formatNumber(decision.replacementCost + decision.queueResetPenalty, 4)} | incumbent {decision.incumbentSource}{" "}
                         {decision.incumbentTicker} {decision.incumbentSide}
@@ -1112,8 +1118,8 @@ export function PredictionAutomationPanel() {
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
                   <p className="mb-2 text-[11px] font-semibold text-sky-200">Stale-Order Maintenance</p>
                   {attribution.orderMaintenance?.recent.length ? (
-                    attribution.orderMaintenance.recent.map((decision) => (
-                      <p key={decision.orderId} className="mt-1 text-[11px] text-slate-300">
+                    attribution.orderMaintenance.recent.map((decision, index) => (
+                      <p key={uniqueRowKey([decision.orderId, decision.action, decision.ticker, decision.suggestedPriceCents], index)} className="mt-1 text-[11px] text-slate-300">
                         {decision.ticker} {decision.side} | {decision.action} | keep {formatNumber(decision.evKeep, 4)} | reprice{" "}
                         {formatNumber(decision.evReprice, 4)} | cancel {formatNumber(decision.evCancel, 4)} | improve{" "}
                         {formatNumber(decision.expectedImprovement, 4)}
@@ -1127,8 +1133,8 @@ export function PredictionAutomationPanel() {
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
                   <p className="mb-2 text-[11px] font-semibold text-sky-200">Watchlist Table</p>
                   {attribution.watchlist?.recent.length ? (
-                    attribution.watchlist.recent.map((event) => (
-                      <p key={`${event.type}-${event.key}-${event.reason}`} className="mt-1 text-[11px] text-slate-300">
+                    attribution.watchlist.recent.map((event, index) => (
+                      <p key={uniqueRowKey([event.type, event.key, event.reason, event.promotionScore], index)} className="mt-1 text-[11px] text-slate-300">
                         {event.ticker} {event.side} | {event.type} | promo {formatNumber(event.promotionScore, 4)} | age{" "}
                         {formatNumber(event.avgWatchlistHours, 1)}h | edge {formatPercent(event.executionAdjustedEdge ?? event.edge)} |{" "}
                         {event.reason}
@@ -1142,8 +1148,8 @@ export function PredictionAutomationPanel() {
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
                   <p className="mb-2 text-[11px] font-semibold text-sky-200">Learning Recommendations</p>
                   {attribution.learning?.recommendations.length ? (
-                    attribution.learning.recommendations.map((recommendation) => (
-                      <p key={recommendation.gate} className="mt-1 text-[11px] text-slate-300">
+                    attribution.learning.recommendations.map((recommendation, index) => (
+                      <p key={uniqueRowKey([recommendation.gate, recommendation.sampleCount, recommendation.boundedDelta], index)} className="mt-1 text-[11px] text-slate-300">
                         {recommendation.label} | samples {recommendation.sampleCount} | pnl {formatUsd(recommendation.avgCounterfactualPnlUsd)} | delta{" "}
                         {formatGateMiss(recommendation.boundedDelta, recommendation.unit)} | active {recommendation.active ? "yes" : "no"}
                       </p>
@@ -1156,8 +1162,8 @@ export function PredictionAutomationPanel() {
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
                   <p className="mb-2 text-[11px] font-semibold text-sky-200">Liquidation Recommendations</p>
                   {attribution.liquidation?.recent.length ? (
-                    attribution.liquidation.recent.map((decision) => (
-                      <p key={`${decision.ticker}-${decision.side}-${decision.action}`} className="mt-1 text-[11px] text-slate-300">
+                    attribution.liquidation.recent.map((decision, index) => (
+                      <p key={uniqueRowKey([decision.ticker, decision.side, decision.action, decision.timeToResolutionDays], index)} className="mt-1 text-[11px] text-slate-300">
                         {decision.ticker} {decision.side} | {decision.action} | hold {formatUsd(decision.valueHoldToResolutionUsd)} | exit{" "}
                         {formatUsd(decision.valueExitNowUsd)} | cost {formatUsd(decision.liquidationCostUsd)}
                       </p>
@@ -1172,13 +1178,13 @@ export function PredictionAutomationPanel() {
                   {attribution.overlays && (attribution.overlays.recentSilentClock.length || attribution.overlays.recentLeadLag.length) ? (
                     <div className="space-y-1">
                       {attribution.overlays.recentSilentClock.map((overlay, index) => (
-                        <p key={`silent-${index}`} className="text-[11px] text-slate-300">
+                        <p key={uniqueRowKey(["silent", overlay.checkpointProgress, overlay.decayPenalty], index)} className="text-[11px] text-slate-300">
                           Silent clock | checkpoint {formatPercent(overlay.checkpointProgress)} | penalty {formatPercent(overlay.decayPenalty)} |{" "}
                           {overlay.rationale}
                         </p>
                       ))}
                       {attribution.overlays.recentLeadLag.map((overlay, index) => (
-                        <p key={`leadlag-${index}`} className="text-[11px] text-slate-300">
+                        <p key={uniqueRowKey(["leadlag", overlay.leadTicker, overlay.lagTicker, overlay.signalMagnitude], index)} className="text-[11px] text-slate-300">
                           Lead-lag {overlay.leadTicker} -&gt; {overlay.lagTicker} | signal {formatPercent(overlay.signalMagnitude)} | conf{" "}
                           {formatPercent(overlay.confidence)}
                         </p>
@@ -1202,8 +1208,8 @@ export function PredictionAutomationPanel() {
                   <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                     <p className="text-[11px] text-slate-400">Top 3 Highest EV</p>
                     {summary.portfolioRanking.highestEv.length ? (
-                      summary.portfolioRanking.highestEv.map((item) => (
-                        <p key={`ev-${item.ticker}`} className="mt-1 text-[11px] text-slate-300">
+                      summary.portfolioRanking.highestEv.map((item, index) => (
+                        <p key={uniqueRowKey(["ev", item.ticker, item.verdict], index)} className="mt-1 text-[11px] text-slate-300">
                           {item.ticker} | Edge {(item.edge * 100).toFixed(2)}% | EV/$ {(item.expectedValuePerDollarRisked * 100).toFixed(2)}%
                         </p>
                       ))
@@ -1215,8 +1221,8 @@ export function PredictionAutomationPanel() {
                   <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                     <p className="text-[11px] text-slate-400">Top 3 Safest</p>
                     {summary.portfolioRanking.safest.length ? (
-                      summary.portfolioRanking.safest.map((item) => (
-                        <p key={`safe-${item.ticker}`} className="mt-1 text-[11px] text-slate-300">
+                      summary.portfolioRanking.safest.map((item, index) => (
+                        <p key={uniqueRowKey(["safe", item.ticker, item.verdict], index)} className="mt-1 text-[11px] text-slate-300">
                           {item.ticker} | Confidence {(item.confidence * 100).toFixed(0)}% | Horizon {item.timeToCloseDays.toFixed(2)}d
                         </p>
                       ))
@@ -1228,8 +1234,8 @@ export function PredictionAutomationPanel() {
                   <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                     <p className="text-[11px] text-slate-400">Top 3 Asymmetric Longshots</p>
                     {summary.portfolioRanking.asymmetricLongshots.length ? (
-                      summary.portfolioRanking.asymmetricLongshots.map((item) => (
-                        <p key={`long-${item.ticker}`} className="mt-1 text-[11px] text-slate-300">
+                      summary.portfolioRanking.asymmetricLongshots.map((item, index) => (
+                        <p key={uniqueRowKey(["long", item.ticker, item.verdict], index)} className="mt-1 text-[11px] text-slate-300">
                           {item.ticker} | Price lean {item.verdict} | AdjEdge {(item.confidenceAdjustedEdge * 100).toFixed(2)}%
                         </p>
                       ))
@@ -1241,8 +1247,8 @@ export function PredictionAutomationPanel() {
                   <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                     <p className="text-[11px] text-slate-400">Top Traps to Avoid</p>
                     {summary.portfolioRanking.trapsToAvoid.length ? (
-                      summary.portfolioRanking.trapsToAvoid.map((item) => (
-                        <p key={`trap-${item.ticker}`} className="mt-1 text-[11px] text-slate-300">
+                      summary.portfolioRanking.trapsToAvoid.map((item, index) => (
+                        <p key={uniqueRowKey(["trap", item.ticker, item.reason], index)} className="mt-1 text-[11px] text-slate-300">
                           {item.ticker}: {item.reason}
                         </p>
                       ))
