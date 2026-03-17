@@ -6,11 +6,18 @@ import type {
   ExecutionBootstrapMode,
   ExecutionHealthRegime,
   ExecutionPlanRole,
+  FalseNegativeLearningOutput,
+  LeadLagSignal,
+  LiquidationDecision,
+  OrderMaintenanceDecision,
   OpportunityType,
   PredictionCandidate,
   PredictionCategory,
   ProbabilityTransform,
+  ReplacementDecision,
   ShadowBaselineProfile,
+  SilentClockContribution,
+  WatchlistEvent,
 } from "@/lib/prediction/types";
 
 export type PredictionStorageLayer = "raw" | "derived";
@@ -24,6 +31,12 @@ export type PredictionStorageStream =
   | "orderbook_events"
   | "candidate_decisions"
   | "shadow_baselines"
+  | "replacement_decisions"
+  | "order_actions"
+  | "watchlist_events"
+  | "learning_outputs"
+  | "liquidation_decisions"
+  | "signal_overlays"
   | "resolutions"
   | "markouts";
 
@@ -181,6 +194,13 @@ export interface StoredCandidateDecisionEvent {
   uncertaintyWidth?: number;
   toxicityScore?: number;
   riskCluster?: string;
+  incumbentComparison?: ReplacementDecision;
+  replacementScoreDelta?: number;
+  watchlistState?: PredictionCandidate["watchlistState"];
+  silentClock?: SilentClockContribution;
+  leadLag?: LeadLagSignal;
+  liquidationRecommendation?: LiquidationDecision;
+  orderMaintenance?: OrderMaintenanceDecision;
   executionStatus?: "PLACED" | "SKIPPED" | "FAILED";
   executionMessage?: string;
   executionOrderId?: string;
@@ -233,6 +253,40 @@ export interface StoredShadowBaselineEvent {
   notes: string[];
 }
 
+export interface StoredReplacementDecisionEvent extends ReplacementDecision {
+  runId: string;
+  mode: AutomationMode;
+}
+
+export interface StoredOrderMaintenanceEvent extends OrderMaintenanceDecision {
+  runId: string;
+  mode: AutomationMode;
+}
+
+export interface StoredWatchlistEvent extends WatchlistEvent {
+  runId?: string;
+  mode?: AutomationMode;
+}
+
+export interface StoredLearningOutputEvent extends FalseNegativeLearningOutput {
+  runId?: string;
+  mode?: AutomationMode;
+}
+
+export interface StoredLiquidationDecisionEvent extends LiquidationDecision {
+  runId: string;
+  mode: AutomationMode;
+}
+
+export interface StoredSignalOverlayEvent {
+  runId: string;
+  mode: AutomationMode;
+  ticker: string;
+  side: "YES" | "NO";
+  silentClock?: SilentClockContribution;
+  leadLag?: LeadLagSignal;
+}
+
 export type MarkoutHorizonKey = "5s" | "30s" | "2m" | "10m" | "expiry";
 
 export interface StoredMarkoutEvent {
@@ -258,6 +312,12 @@ export interface PredictionReplayDay {
   orderbookEvents: Array<PredictionStorageEnvelope<StoredOrderbookEvent>>;
   candidateDecisions: Array<PredictionStorageEnvelope<StoredCandidateDecisionEvent>>;
   shadowBaselines: Array<PredictionStorageEnvelope<StoredShadowBaselineEvent>>;
+  replacementDecisions: Array<PredictionStorageEnvelope<StoredReplacementDecisionEvent>>;
+  orderActions: Array<PredictionStorageEnvelope<StoredOrderMaintenanceEvent>>;
+  watchlistEvents: Array<PredictionStorageEnvelope<StoredWatchlistEvent>>;
+  learningOutputs: Array<PredictionStorageEnvelope<StoredLearningOutputEvent>>;
+  liquidationDecisions: Array<PredictionStorageEnvelope<StoredLiquidationDecisionEvent>>;
+  signalOverlays: Array<PredictionStorageEnvelope<StoredSignalOverlayEvent>>;
   resolutions: Array<PredictionStorageEnvelope<StoredResolutionEvent>>;
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
@@ -272,6 +332,12 @@ export type PredictionReplayEvent =
   | PredictionStorageEnvelope<StoredOrderbookEvent>
   | PredictionStorageEnvelope<StoredCandidateDecisionEvent>
   | PredictionStorageEnvelope<StoredShadowBaselineEvent>
+  | PredictionStorageEnvelope<StoredReplacementDecisionEvent>
+  | PredictionStorageEnvelope<StoredOrderMaintenanceEvent>
+  | PredictionStorageEnvelope<StoredWatchlistEvent>
+  | PredictionStorageEnvelope<StoredLearningOutputEvent>
+  | PredictionStorageEnvelope<StoredLiquidationDecisionEvent>
+  | PredictionStorageEnvelope<StoredSignalOverlayEvent>
   | PredictionStorageEnvelope<StoredResolutionEvent>
   | PredictionStorageEnvelope<StoredMarkoutEvent>;
 
@@ -320,6 +386,13 @@ export function toStoredCandidateDecisionPayload(
     uncertaintyWidth: candidate.uncertaintyWidth,
     toxicityScore: candidate.toxicityScore,
     riskCluster: candidate.riskCluster,
+    incumbentComparison: candidate.incumbentComparison,
+    replacementScoreDelta: candidate.replacementScoreDelta,
+    watchlistState: candidate.watchlistState,
+    silentClock: candidate.silentClock,
+    leadLag: candidate.leadLag,
+    liquidationRecommendation: candidate.liquidationRecommendation,
+    orderMaintenance: candidate.orderMaintenance,
     executionStatus: candidate.executionStatus,
     executionMessage: candidate.executionMessage,
     executionOrderId: candidate.executionOrderId,

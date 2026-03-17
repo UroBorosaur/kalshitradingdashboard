@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { getOptionChainSnapshots, getStockSnapshots } from "@/lib/live/alpaca";
 import {
+  cancelKalshiDemoOrder,
   getKalshiDemoBalanceUsd,
   getKalshiDemoBalancesUsd,
   kalshiConnectionStatus,
@@ -12,7 +13,12 @@ import {
 import { ensureClusterOrderGuards } from "@/lib/prediction/order-groups";
 import { deriveClusterGuardSpecs } from "@/lib/prediction/order-group-rules";
 import type { ClusterGuardResult } from "@/lib/prediction/order-groups";
-import { getKalshiOpenMarketsStream, getKalshiPrivateStateStream, getKalshiStreamStatus } from "@/lib/prediction/kalshi-stream";
+import {
+  getKalshiOpenMarketsStream,
+  getKalshiPrivateStateStream,
+  getKalshiRecentMarketHistoryStream,
+  getKalshiStreamStatus,
+} from "@/lib/prediction/kalshi-stream";
 import {
   estimateKalshiFeeRounded,
   marketContractStep,
@@ -21,7 +27,29 @@ import {
   snapProbabilityToMarket,
 } from "@/lib/prediction/fixed-point";
 import { refreshMarkoutTelemetry } from "@/lib/prediction/markouts";
-import { persistCandidateDecisions, persistKalshiBalanceSnapshot, persistMarketScan, persistShadowBaselines } from "@/lib/storage/prediction-store";
+import {
+  persistCandidateDecisions,
+  persistKalshiBalanceSnapshot,
+  persistLearningOutput,
+  persistLiquidationDecisions,
+  persistMarketScan,
+  persistOrderMaintenanceDecisions,
+  persistReplacementDecisions,
+  persistShadowBaselines,
+  persistSignalOverlays,
+  persistWatchlistEvents,
+} from "@/lib/storage/prediction-store";
+import { buildFalseNegativeLearning } from "@/lib/prediction/false-negative-learning";
+import { loadExecutionAttributionSummary } from "@/lib/prediction/execution-attribution";
+import { evaluateLiquidationDecision } from "@/lib/prediction/liquidation";
+import { evaluateOrderMaintenance } from "@/lib/prediction/order-maintenance";
+import {
+  buildOpenExposureConstraint,
+  evaluateReplacementDecision,
+  type OpenExposureConstraint as OpenPositionConstraint,
+} from "@/lib/prediction/replacement";
+import { estimateLeadLagSignal, estimateSilentClockContribution } from "@/lib/prediction/signal-overlays";
+import { updateWatchlistLifecycle } from "@/lib/prediction/watchlist";
 import {
   entmaxBisect,
   logit,
@@ -41,6 +69,9 @@ import type {
   CalibrationMethod,
   CandidateVerdict,
   ExecutionPlanRole,
+  FalseNegativeLearningOutput,
+  LeadLagSignal,
+  LiquidationDecision,
   OpportunityType,
   PortfolioRanking,
   PredictionCandidate,
@@ -48,12 +79,14 @@ import type {
   PredictionMarketQuote,
   PredictionSide,
   ProbabilityTransform,
+  ReplacementDecision,
   ShadowBaselineSummary,
   ShadowBaselineProfile,
+  SilentClockContribution,
   StrategicBreakdown,
   StrategyTag,
-  KalshiPositionLite,
-  KalshiOrderLite,
+  WatchlistPromotionDecision,
+  WatchlistState,
 } from "@/lib/prediction/types";
 
 interface ModeRules {
@@ -317,6 +350,14 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   favoriteLongshotEnabled: true,
   throughputRecoveryEnabled: true,
   exploratoryFallbackEnabled: true,
+  replacementEnabled: true,
+  replacementMinDelta: 0.02,
+  orderMaintenanceEnabled: true,
+  cancelReplaceMinImprovement: 0.01,
+  watchlistPromotionEnabled: true,
+  watchlistPromotionThreshold: 0.035,
+  adaptiveLearningEnabled: false,
+  liquidationAdvisoryEnabled: true,
 };
 
 interface HighProbThresholds {
@@ -324,13 +365,6 @@ interface HighProbThresholds {
   marketMin: number;
   edgeMin: number;
   confidenceMin: number;
-}
-
-interface OpenPositionConstraint {
-  tickers: Set<string>;
-  sameSideKeys: Set<string>;
-  orderTickers: Set<string>;
-  orderSideKeys: Set<string>;
 }
 
 interface RulebookProbabilityEstimate {
@@ -409,6 +443,8 @@ interface ModelProbabilityEstimate {
     probability: number;
     weight: number;
   }>;
+  silentClock?: SilentClockContribution | null;
+  leadLag?: LeadLagSignal | null;
 }
 
 interface SyntheticDigitalBand {
@@ -441,6 +477,12 @@ interface ActionableCandidateOptions {
   ignoreToxicityGate?: boolean;
 }
 
+interface AdaptiveGateContext {
+  toxicityThreshold: number;
+  uncertaintyThreshold: number;
+  learningActive: boolean;
+}
+
 const REQUIRED_PRIVATE_STREAM_CHANNELS = ["user_orders", "fill", "market_positions", "order_group_updates"] as const;
 
 function upsertGateDiagnostic(
@@ -466,6 +508,22 @@ function normalizeAutomationControls(input?: Partial<AutomationControls>): Autom
     favoriteLongshotEnabled: input?.favoriteLongshotEnabled ?? DEFAULT_AUTOMATION_CONTROLS.favoriteLongshotEnabled,
     throughputRecoveryEnabled: input?.throughputRecoveryEnabled ?? DEFAULT_AUTOMATION_CONTROLS.throughputRecoveryEnabled,
     exploratoryFallbackEnabled: input?.exploratoryFallbackEnabled ?? DEFAULT_AUTOMATION_CONTROLS.exploratoryFallbackEnabled,
+    replacementEnabled: input?.replacementEnabled ?? DEFAULT_AUTOMATION_CONTROLS.replacementEnabled,
+    replacementMinDelta: clamp(input?.replacementMinDelta ?? DEFAULT_AUTOMATION_CONTROLS.replacementMinDelta, 0, 0.15),
+    orderMaintenanceEnabled: input?.orderMaintenanceEnabled ?? DEFAULT_AUTOMATION_CONTROLS.orderMaintenanceEnabled,
+    cancelReplaceMinImprovement: clamp(
+      input?.cancelReplaceMinImprovement ?? DEFAULT_AUTOMATION_CONTROLS.cancelReplaceMinImprovement,
+      0,
+      0.08,
+    ),
+    watchlistPromotionEnabled: input?.watchlistPromotionEnabled ?? DEFAULT_AUTOMATION_CONTROLS.watchlistPromotionEnabled,
+    watchlistPromotionThreshold: clamp(
+      input?.watchlistPromotionThreshold ?? DEFAULT_AUTOMATION_CONTROLS.watchlistPromotionThreshold,
+      0,
+      0.2,
+    ),
+    adaptiveLearningEnabled: input?.adaptiveLearningEnabled ?? DEFAULT_AUTOMATION_CONTROLS.adaptiveLearningEnabled,
+    liquidationAdvisoryEnabled: input?.liquidationAdvisoryEnabled ?? DEFAULT_AUTOMATION_CONTROLS.liquidationAdvisoryEnabled,
   };
 }
 
@@ -603,6 +661,86 @@ function buildExecutionHealthContext(markoutPenalty: number, sampleCount: number
     regime: deriveExecutionHealthRegime(boundedPenalty, sampleCount),
     warnings,
   } satisfies ExecutionHealthContext;
+}
+
+function defaultAdaptiveGateContext(): AdaptiveGateContext {
+  return {
+    toxicityThreshold: 0.9,
+    uncertaintyThreshold: 0.08,
+    learningActive: false,
+  };
+}
+
+function applyLearningToRules(
+  rules: ModeRules,
+  recommendations: FalseNegativeLearningOutput["recommendations"] | undefined,
+): { rules: ModeRules; gates: AdaptiveGateContext; notes: string[] } {
+  if (!recommendations?.length) {
+    return { rules, gates: defaultAdaptiveGateContext(), notes: [] };
+  }
+
+  const adjusted: ModeRules = { ...rules };
+  const gates = defaultAdaptiveGateContext();
+  const notes: string[] = [];
+
+  for (const recommendation of recommendations) {
+    if (!recommendation.active || recommendation.boundedDelta <= 0) continue;
+    if (recommendation.gate === "CONFIDENCE_FLOOR") {
+      adjusted.confidenceFloor = clamp(adjusted.confidenceFloor - recommendation.boundedDelta, 0.28, 0.92);
+      notes.push(`Adaptive learning lowered confidence floor by ${(recommendation.boundedDelta * 100).toFixed(2)} pts.`);
+    }
+    if (recommendation.gate === "EXECUTION_EDGE") {
+      adjusted.minEdge = Math.max(0.0005, adjusted.minEdge - recommendation.boundedDelta);
+      notes.push(`Adaptive learning lowered execution-edge gate by ${(recommendation.boundedDelta * 100).toFixed(2)} pts.`);
+    }
+    if (recommendation.gate === "TOXICITY") {
+      gates.toxicityThreshold = clamp(gates.toxicityThreshold + recommendation.boundedDelta, 0.9, 0.95);
+      notes.push(`Adaptive learning widened toxicity gate to ${(gates.toxicityThreshold * 100).toFixed(1)}%.`);
+    }
+    if (recommendation.gate === "UNCERTAINTY_WIDTH") {
+      gates.uncertaintyThreshold = clamp(gates.uncertaintyThreshold + recommendation.boundedDelta, 0.08, 0.12);
+      notes.push(`Adaptive learning widened uncertainty gate to ${(gates.uncertaintyThreshold * 100).toFixed(1)}%.`);
+    }
+  }
+
+  gates.learningActive = notes.length > 0;
+  return { rules: adjusted, gates, notes };
+}
+
+function applyWatchlistPromotionState(
+  candidates: PredictionCandidate[],
+  watchlistStates: Map<string, WatchlistState>,
+  promotions: Map<string, WatchlistPromotionDecision>,
+) {
+  return candidates.map((candidate) => {
+    const key = candidateKey(candidate);
+    const state = watchlistStates.get(key);
+    const promotion = promotions.get(key);
+    const watchlistState = state
+      ? {
+          status: promotion?.promoted ? ("PROMOTED" as const) : state.resolved ? ("RESOLVED" as const) : ("ACTIVE" as const),
+          ageHours: Number(((new Date(state.lastSeenAt).getTime() - new Date(state.firstSeenAt).getTime()) / 3_600_000).toFixed(4)),
+          cyclesObserved: state.cyclesObserved,
+          promotionScore: promotion?.promotionScore,
+        }
+      : candidate.watchlistState;
+
+    if (candidate.verdict === "WATCHLIST" && promotion?.promoted) {
+      return {
+        ...candidate,
+        verdict: candidate.side === "YES" ? ("BUY_YES" as const) : ("BUY_NO" as const),
+        opportunityType: "TRADE" as const,
+        watchlistState,
+        executionMessage: promotion.reason,
+        rationale: [...candidate.rationale, promotion.reason],
+      };
+    }
+
+    return {
+      ...candidate,
+      watchlistState,
+    };
+  });
 }
 
 function isFiniteNumber(value: number | null | undefined): value is number {
@@ -793,58 +931,14 @@ function meetsGlobalHighProbabilityDefinition(args: {
   };
 }
 
-function normalizePositionSide(positionFp: string): PredictionSide | null {
-  const qty = Number(positionFp);
-  if (!Number.isFinite(qty) || Math.abs(qty) < 1e-9) return null;
-  return qty > 0 ? "YES" : "NO";
-}
-
-function normalizeOrderSide(side: KalshiOrderLite["side"]): PredictionSide {
-  return side === "yes" ? "YES" : "NO";
-}
-
-function shouldBlockRepeatOrder(order: KalshiOrderLite) {
-  const status = order.status.trim().toLowerCase();
-  if (["canceled", "cancelled", "expired", "failed", "rejected"].includes(status)) return false;
-  if ((order.remaining_count ?? 0) > 0) return true;
-  return ["resting", "open", "pending", "partially_filled", "executed", "filled"].includes(status);
-}
-
-function buildOpenPositionConstraint(
-  positions: KalshiPositionLite[],
-  orders: KalshiOrderLite[],
-): OpenPositionConstraint {
-  const tickers = new Set<string>();
-  const sameSideKeys = new Set<string>();
-  const orderTickers = new Set<string>();
-  const orderSideKeys = new Set<string>();
-
-  for (const position of positions) {
-    const ticker = position.ticker.toUpperCase();
-    const side = normalizePositionSide(position.position_fp);
-    if (!ticker || side === null) continue;
-    tickers.add(ticker);
-    sameSideKeys.add(`${ticker}:${side}`);
-  }
-
-  for (const order of orders) {
-    if (!shouldBlockRepeatOrder(order)) continue;
-    const ticker = order.ticker.toUpperCase();
-    const side = normalizeOrderSide(order.side);
-    if (!ticker) continue;
-    orderTickers.add(ticker);
-    orderSideKeys.add(`${ticker}:${side}`);
-  }
-
-  return { tickers, sameSideKeys, orderTickers, orderSideKeys };
-}
-
 function filterExistingPositionCandidates(
   candidates: PredictionCandidate[],
   constraint: OpenPositionConstraint,
+  controls: AutomationControls,
 ): {
   filtered: PredictionCandidate[];
   blocked: PredictionCandidate[];
+  replacementDecisions: ReplacementDecision[];
   skipped: number;
   sameSideSkipped: number;
   orderSkipped: number;
@@ -853,87 +947,83 @@ function filterExistingPositionCandidates(
   let sameSideSkipped = 0;
   let orderSkipped = 0;
   const blocked: PredictionCandidate[] = [];
-  const filtered = candidates.filter((candidate) => {
-    const sameSideKey = `${candidate.ticker}:${candidate.side}`;
-    if (constraint.sameSideKeys.has(sameSideKey)) {
-      skipped += 1;
-      sameSideSkipped += 1;
-      blocked.push({
-        ...candidate,
-        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
-          gate: "POSITION_ORDER_CONFLICT",
-          passed: false,
-          observed: 1,
-          threshold: 0,
-          missBy: 1,
-          unit: "count",
-          detail: "Same-side open exposure already exists.",
-        }),
-        executionStatus: "SKIPPED",
-        executionMessage: "Blocked by existing same-side position.",
-      });
-      return false;
-    }
-    if (constraint.tickers.has(candidate.ticker)) {
-      skipped += 1;
-      blocked.push({
-        ...candidate,
-        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
-          gate: "POSITION_ORDER_CONFLICT",
-          passed: false,
-          observed: 1,
-          threshold: 0,
-          missBy: 1,
-          unit: "count",
-          detail: "Market already has open exposure on another side.",
-        }),
-        executionStatus: "SKIPPED",
-        executionMessage: "Blocked by existing open position in the same market.",
-      });
-      return false;
-    }
-    if (constraint.orderSideKeys.has(sameSideKey)) {
-      skipped += 1;
-      orderSkipped += 1;
-      blocked.push({
-        ...candidate,
-        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
-          gate: "POSITION_ORDER_CONFLICT",
-          passed: false,
-          observed: 1,
-          threshold: 0,
-          missBy: 1,
-          unit: "count",
-          detail: "Same-side order is already active or recently executed.",
-        }),
-        executionStatus: "SKIPPED",
-        executionMessage: "Blocked by existing same-side order.",
-      });
-      return false;
-    }
-    if (constraint.orderTickers.has(candidate.ticker)) {
-      skipped += 1;
-      orderSkipped += 1;
-      blocked.push({
-        ...candidate,
-        gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
-          gate: "POSITION_ORDER_CONFLICT",
-          passed: false,
-          observed: 1,
-          threshold: 0,
-          missBy: 1,
-          unit: "count",
-          detail: "Market already has an active or recent order.",
-        }),
-        executionStatus: "SKIPPED",
-        executionMessage: "Blocked by existing order in the same market.",
-      });
-      return false;
-    }
-    return true;
-  });
+  const replacementDecisions: ReplacementDecision[] = [];
+  const filtered: PredictionCandidate[] = [];
 
-  return { filtered, blocked, skipped, sameSideSkipped, orderSkipped };
+  for (const candidate of candidates) {
+    const sameSideKey = `${candidate.ticker}:${candidate.side}`;
+    const needsConflictCheck =
+      constraint.sameSideKeys.has(sameSideKey) ||
+      constraint.tickers.has(candidate.ticker) ||
+      constraint.orderSideKeys.has(sameSideKey) ||
+      constraint.orderTickers.has(candidate.ticker);
+
+    if (!needsConflictCheck) {
+      filtered.push(candidate);
+      continue;
+    }
+
+    skipped += 1;
+    if (constraint.sameSideKeys.has(sameSideKey)) sameSideSkipped += 1;
+    if (constraint.orderSideKeys.has(sameSideKey) || constraint.orderTickers.has(candidate.ticker)) orderSkipped += 1;
+
+    const incumbents = constraint.incumbentsByCandidateKey.get(sameSideKey) ?? [];
+    const replacement = incumbents.length
+      ? evaluateReplacementDecision({
+          challenger: candidate,
+          incumbents,
+          controls: {
+            enabled: controls.replacementEnabled,
+            minDelta: controls.replacementMinDelta,
+          },
+        })
+      : null;
+
+    if (replacement) replacementDecisions.push(replacement);
+
+    if (replacement?.accepted && replacement.action === "REPLACE_ORDER") {
+      filtered.push({
+        ...candidate,
+        incumbentComparison: replacement,
+        replacementScoreDelta: replacement.replacementScoreDelta,
+        executionMessage: replacement.reason,
+        rationale: [...candidate.rationale, replacement.reason],
+      });
+      continue;
+    }
+
+    const detail =
+      replacement?.reason ??
+      (constraint.sameSideKeys.has(sameSideKey)
+        ? "Same-side open exposure already exists."
+        : constraint.orderSideKeys.has(sameSideKey)
+          ? "Same-side order is already active or recently executed."
+          : constraint.orderTickers.has(candidate.ticker)
+            ? "Market already has an active or recent order."
+            : "Market already has open exposure on another side.");
+
+    blocked.push({
+      ...candidate,
+      incumbentComparison: replacement ?? undefined,
+      replacementScoreDelta: replacement?.replacementScoreDelta,
+      gateDiagnostics: upsertGateDiagnostic(candidate.gateDiagnostics, {
+        gate: "POSITION_ORDER_CONFLICT",
+        passed: false,
+        observed: 1,
+        threshold: 0,
+        missBy: 1,
+        unit: "count",
+        detail,
+      }),
+      executionStatus: "SKIPPED",
+      executionMessage:
+        replacement?.accepted && replacement.action === "RECOMMEND_POSITION_SWAP"
+          ? `${replacement.reason} Live position replacement is advisory-only in Phase 7.`
+          : detail,
+    });
+  }
+
+  return { filtered, blocked, replacementDecisions, skipped, sameSideSkipped, orderSkipped };
 }
 
 function marketYesReferenceProb(market: PredictionMarketQuote) {
@@ -2946,6 +3036,8 @@ function estimateModelProbability(
   inferredRegime: { label: string; confidence: number },
   btcSpot: number | null,
   overlayContext: OverlayContext,
+  relatedMarkets: PredictionMarketQuote[],
+  historyByTicker: Map<string, Array<{ recordedAt: string; yesBid: number | null; yesAsk: number | null; lastPrice: number | null }>>,
 ): ModelProbabilityEstimate {
   const marketProb = firstDefined(
     market.yesAsk,
@@ -3041,6 +3133,34 @@ function estimateModelProbability(
     });
   }
 
+  const silentClock = estimateSilentClockContribution({
+    market,
+    baseProbability: anchorProb,
+  });
+  if (silentClock && silentClock.eligible && silentClock.decayPenalty > 0) {
+    experts.push({
+      expert: "silent_clock",
+      probability: silentClock.adjustedProbability,
+      score: clamp(0.24 + silentClock.checkpointProgress * 0.55 - spread * 0.3, -1.5, 1.5),
+      rationale: silentClock.rationale,
+    });
+  }
+
+  const leadLag = estimateLeadLagSignal({
+    market,
+    relatedMarkets,
+    historyByTicker,
+    baseProbability: anchorProb,
+  });
+  if (leadLag && Math.abs(leadLag.signalMagnitude) > 0.012) {
+    experts.push({
+      expert: "lead_lag",
+      probability: leadLag.adjustedProbability,
+      score: clamp(0.18 + leadLag.confidence * 0.8 - spread * 0.2, -1.5, 1.5),
+      rationale: leadLag.rationale,
+    });
+  }
+
   if (inferredRegime.label === "HIGH_VOL_ADVERSARIAL" || inferredRegime.label === "LOW_LIQUIDITY_TRAP") {
     const shrink = inferredRegime.label === "HIGH_VOL_ADVERSARIAL" ? 0.86 : 0.8;
     experts.push({
@@ -3089,6 +3209,8 @@ function estimateModelProbability(
     probabilityTransform: expertMixture.transform,
     calibrationMethod,
     expertWeights: expertMixture.weights,
+    silentClock,
+    leadLag,
   };
 }
 
@@ -3104,8 +3226,12 @@ function candidateFromMarket(
   mathContext: MarketMathContext,
   overlayContext: OverlayContext,
   executionHealth: ExecutionHealthContext,
+  allMarkets: PredictionMarketQuote[],
+  historyByTicker: Map<string, Array<{ recordedAt: string; yesBid: number | null; yesAsk: number | null; lastPrice: number | null }>>,
+  adaptiveGates: AdaptiveGateContext,
 ): PredictionCandidate | null {
-  const probabilityEstimate = estimateModelProbability(market, mode, inferredRegime, btcSpot, overlayContext);
+  const relatedMarkets = allMarkets.filter((candidate) => candidate.ticker !== market.ticker && deriveRiskCluster(candidate) === deriveRiskCluster(market));
+  const probabilityEstimate = estimateModelProbability(market, mode, inferredRegime, btcSpot, overlayContext, relatedMarkets, historyByTicker);
   const { modelProb, rationale } = probabilityEstimate;
 
   const yesPrice = firstDefined(
@@ -3138,6 +3264,8 @@ function candidateFromMarket(
   const riskCluster = deriveRiskCluster(market);
   strategyTags.push("MIXTURE_OF_EXPERTS");
   if (probabilityEstimate.calibrationMethod === "TEMPERATURE") strategyTags.push("TEMPERATURE_CALIBRATED");
+  if (probabilityEstimate.silentClock?.eligible && (probabilityEstimate.silentClock.decayPenalty ?? 0) > 0) strategyTags.push("SILENT_CLOCK_DECAY");
+  if (probabilityEstimate.leadLag) strategyTags.push("LEAD_LAG_OVERLAY");
 
   const sideAsk = chosenSide === "YES"
     ? firstDefined(market.yesAsk, yesPrice)
@@ -3340,7 +3468,13 @@ function candidateFromMarket(
   const contracts = snapContractCount(plannedStake / executionPrice, contractStep, "down");
   if (contracts < contractStep) return null;
   if (!isFiniteNumber(edge) || !isFiniteNumber(confidence)) return null;
-  if (rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice && uncertaintyWidth >= 0.08) return null;
+  if (
+    rulebookEstimate.lower <= executionPrice &&
+    rulebookEstimate.upper >= executionPrice &&
+    uncertaintyWidth >= adaptiveGates.uncertaintyThreshold
+  ) {
+    return null;
+  }
   if (executionAlpha.toxicityScore >= TOXICITY_PASSIVE_SHUTOFF && !robustRulebookPass && !favoriteLongshotActive.autoExecute) return null;
   const feeEstimate = estimateFeeUsd({
     market,
@@ -3531,22 +3665,26 @@ function candidateFromMarket(
     },
     {
       gate: "TOXICITY",
-      passed: executionAlpha.toxicityScore < 0.9,
+      passed: executionAlpha.toxicityScore < adaptiveGates.toxicityThreshold,
       observed: Number(executionAlpha.toxicityScore.toFixed(6)),
-      threshold: 0.9,
-      missBy: Number(Math.max(0, executionAlpha.toxicityScore - 0.9).toFixed(6)),
+      threshold: Number(adaptiveGates.toxicityThreshold.toFixed(6)),
+      missBy: Number(Math.max(0, executionAlpha.toxicityScore - adaptiveGates.toxicityThreshold).toFixed(6)),
       unit: "probability",
-      detail: "Actionable queue requires toxicity below 90%.",
+      detail: `Actionable queue requires toxicity below ${(adaptiveGates.toxicityThreshold * 100).toFixed(1)}%.`,
     },
     {
       gate: "UNCERTAINTY_WIDTH",
-      passed: !(rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice && uncertaintyWidth >= 0.08),
+      passed: !(
+        rulebookEstimate.lower <= executionPrice &&
+        rulebookEstimate.upper >= executionPrice &&
+        uncertaintyWidth >= adaptiveGates.uncertaintyThreshold
+      ),
       observed: Number(uncertaintyWidth.toFixed(6)),
-      threshold: 0.08,
+      threshold: Number(adaptiveGates.uncertaintyThreshold.toFixed(6)),
       missBy: Number(
         (
           rulebookEstimate.lower <= executionPrice && rulebookEstimate.upper >= executionPrice
-            ? Math.max(0, uncertaintyWidth - 0.08)
+            ? Math.max(0, uncertaintyWidth - adaptiveGates.uncertaintyThreshold)
             : 0
         ).toFixed(6),
       ),
@@ -3602,6 +3740,8 @@ function candidateFromMarket(
     uncertaintyWidth: Number(uncertaintyWidth.toFixed(6)),
     toxicityScore: Number(executionAlpha.toxicityScore.toFixed(6)),
     riskCluster,
+    silentClock: probabilityEstimate.silentClock ?? undefined,
+    leadLag: probabilityEstimate.leadLag ?? undefined,
     executionPlan: {
       limitPriceCents: probabilityToCents(executionPrice),
       patienceHours: Number(executionAlpha.patienceHours.toFixed(2)),
@@ -4442,8 +4582,11 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const existingOrders = livePrivateState.orders;
   const recentFills = livePrivateState.fills;
   const accountBalanceUsd = account.balanceUsd;
-  const openPositionConstraint = buildOpenPositionConstraint(existingPositions, existingOrders);
   const bootstrapMode = deriveBootstrapMode();
+  const marketsByTicker = new Map(markets.map((market) => [market.ticker.toUpperCase(), market] as const));
+  const riskClusterByTicker = new Map(markets.map((market) => [market.ticker.toUpperCase(), deriveRiskCluster(market)] as const));
+  const historyByTicker = getKalshiRecentMarketHistoryStream(markets.map((market) => market.ticker));
+  const openPositionConstraint = buildOpenExposureConstraint(existingPositions, existingOrders, marketsByTicker, riskClusterByTicker);
 
   const initialBalances = await getKalshiDemoBalancesUsd().catch(() => ({ cashUsd: null, portfolioUsd: null }));
   await persistKalshiBalanceSnapshot({
@@ -4460,6 +4603,27 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     warnings.push("Private stream bootstrap is event-primed rather than fully acked; execution attribution will flag this run.");
   }
 
+  const priorAttribution = await loadExecutionAttributionSummary({ lookbackHours: 72, recentTradeLimit: 12, bucketLimit: 6 }).catch(() => null);
+  const learningOutput = priorAttribution
+    ? buildFalseNegativeLearning({
+        attribution: priorAttribution,
+        lookbackHours: 72,
+        active: controls.adaptiveLearningEnabled,
+      })
+    : null;
+  if (learningOutput) {
+    await persistLearningOutput({
+      output: learningOutput,
+      runId,
+      mode,
+      source: "automation/false-negative-learning",
+    }).catch(() => undefined);
+  }
+  const learningApplied = applyLearningToRules(rules, learningOutput?.recommendations);
+  rules = learningApplied.rules;
+  warnings.push(...learningApplied.notes);
+  const adaptiveGates = learningApplied.gates;
+
   const inferredRegime = detectGlobalRegime(markets);
   const mathContext = buildMarketMathContext(markets);
   const overlayContext = await buildOverlayContext(markets);
@@ -4469,6 +4633,29 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }).catch(() => {
     warnings.push("Storage warning: failed to persist market scan snapshot.");
   });
+  const liquidationDecisions: LiquidationDecision[] = controls.liquidationAdvisoryEnabled
+    ? existingPositions
+        .map((position) => {
+          const market = marketsByTicker.get(position.ticker.toUpperCase());
+          if (!market) return null;
+          return evaluateLiquidationDecision({
+            position,
+            market,
+            riskCluster: riskClusterByTicker.get(position.ticker.toUpperCase()),
+          });
+        })
+        .filter((decision): decision is LiquidationDecision => decision !== null)
+    : [];
+  if (liquidationDecisions.length) {
+    await persistLiquidationDecisions({
+      runId,
+      mode,
+      decisions: liquidationDecisions,
+      source: "automation/liquidation-decisions",
+    }).catch(() => {
+      warnings.push("Storage warning: failed to persist liquidation decisions.");
+    });
+  }
   const markoutDiagnostics = await refreshMarkoutTelemetry(recentFills, markets).catch(() => null);
   const markoutPenalty = markoutDiagnostics
     ? Math.max(
@@ -4506,11 +4693,24 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         mathContext,
         overlayContext,
         executionHealth,
+        markets,
+        historyByTicker,
+        adaptiveGates,
       ),
     )
     .filter((candidate): candidate is PredictionCandidate => candidate !== null);
-  const generatedFilter = filterExistingPositionCandidates(generatedRaw, openPositionConstraint);
+  const generatedFilter = filterExistingPositionCandidates(generatedRaw, openPositionConstraint, controls);
   const generated = generatedFilter.filtered;
+  if (generatedFilter.replacementDecisions.length) {
+    await persistReplacementDecisions({
+      runId,
+      mode,
+      decisions: generatedFilter.replacementDecisions,
+      source: "automation/replacement-decisions",
+    }).catch(() => {
+      warnings.push("Storage warning: failed to persist replacement decisions.");
+    });
+  }
   if (generatedFilter.blocked.length) {
     await persistCandidateDecisions({
       runId,
@@ -4557,7 +4757,16 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       inferredRegime,
       maxDailyRiskUsd,
     );
-    const exploratory = filterExistingPositionCandidates(exploratoryRaw, openPositionConstraint).filtered;
+    const exploratoryFilter = filterExistingPositionCandidates(exploratoryRaw, openPositionConstraint, controls);
+    if (exploratoryFilter.replacementDecisions.length) {
+      await persistReplacementDecisions({
+        runId,
+        mode,
+        decisions: exploratoryFilter.replacementDecisions,
+        source: "automation/exploratory-replacements",
+      }).catch(() => undefined);
+    }
+    const exploratory = exploratoryFilter.filtered;
     if (exploratory.length) {
       selected = exploratory;
       candidateUniverse = mergeCandidateUniverse(candidateUniverse, selected);
@@ -4575,6 +4784,27 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }).catch(() => {
     warnings.push("Storage warning: failed to persist planned candidate decisions.");
   });
+  const watchlistLifecycle = await updateWatchlistLifecycle({
+    runId,
+    candidates: planned,
+    promotionThreshold: controls.watchlistPromotionThreshold,
+    enabled: controls.watchlistPromotionEnabled,
+  }).catch(() => null);
+  if (watchlistLifecycle) {
+    planned = applyWatchlistPromotionState(planned, watchlistLifecycle.states, watchlistLifecycle.promotions);
+    await persistWatchlistEvents({
+      events: watchlistLifecycle.events,
+      runId,
+      mode,
+      source: "automation/watchlist-lifecycle",
+    }).catch(() => {
+      warnings.push("Storage warning: failed to persist watchlist lifecycle events.");
+    });
+    const promotedCount = [...watchlistLifecycle.promotions.values()].filter((decision) => decision.promoted).length;
+    if (promotedCount > 0) {
+      warnings.push(`Watchlist promotion activated for ${promotedCount} candidate${promotedCount === 1 ? "" : "s"}.`);
+    }
+  }
   let actionable = actionableCandidates(planned, mode);
 
   const targetActionable = deriveActionableTarget(selected, maxDailyRiskUsd, mode);
@@ -4595,6 +4825,9 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
           mathContext,
           overlayContext,
           executionHealth,
+          markets,
+          historyByTicker,
+          adaptiveGates,
         ),
       )
         .filter((candidate): candidate is PredictionCandidate => candidate !== null)
@@ -4605,7 +4838,16 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
             ...candidate.rationale,
           ],
         }));
-      const relaxedGeneratedFiltered = filterExistingPositionCandidates(relaxedGenerated, openPositionConstraint).filtered;
+      const relaxedFilter = filterExistingPositionCandidates(relaxedGenerated, openPositionConstraint, controls);
+      if (relaxedFilter.replacementDecisions.length) {
+        await persistReplacementDecisions({
+          runId,
+          mode,
+          decisions: relaxedFilter.replacementDecisions,
+          source: `automation/throughput-recovery-replacements-${step}`,
+        }).catch(() => undefined);
+      }
+      const relaxedGeneratedFiltered = relaxedFilter.filtered;
 
       if (!relaxedGeneratedFiltered.length) continue;
 
@@ -4648,7 +4890,16 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       inferredRegime,
       maxDailyRiskUsd,
     ).filter((candidate) => isBuyVerdict(candidate.verdict) && candidate.expectedValuePerDollarRisked > 0);
-    const exploratoryBoost = filterExistingPositionCandidates(exploratoryBoostRaw, openPositionConstraint).filtered;
+    const exploratoryBoostFilter = filterExistingPositionCandidates(exploratoryBoostRaw, openPositionConstraint, controls);
+    if (exploratoryBoostFilter.replacementDecisions.length) {
+      await persistReplacementDecisions({
+        runId,
+        mode,
+        decisions: exploratoryBoostFilter.replacementDecisions,
+        source: "automation/exploratory-boost-replacements",
+      }).catch(() => undefined);
+    }
+    const exploratoryBoost = exploratoryBoostFilter.filtered;
 
     if (exploratoryBoost.length) {
       candidateUniverse = mergeCandidateUniverse(candidateUniverse, exploratoryBoost);
@@ -4797,6 +5048,67 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }).catch(() => {
     warnings.push("Storage warning: failed to persist shadow baseline comparisons.");
   });
+  const candidateByKey = new Map(executionQueue.map((candidate) => [candidateKey(candidate), candidate] as const));
+  const orderMaintenanceDecisions = controls.orderMaintenanceEnabled
+    ? existingOrders
+        .filter((order) => {
+          const status = order.status.trim().toLowerCase();
+          return ["resting", "open", "pending", "partially_filled"].includes(status);
+        })
+        .map((order) =>
+          evaluateOrderMaintenance({
+            order,
+            market: marketsByTicker.get(order.ticker.toUpperCase()),
+            challenger: candidateByKey.get(`${order.ticker.toUpperCase()}:${order.side === "yes" ? "YES" : "NO"}`),
+            minImprovement: controls.cancelReplaceMinImprovement,
+            clusterTriggered: Boolean(
+              (candidateByKey.get(`${order.ticker.toUpperCase()}:${order.side === "yes" ? "YES" : "NO"}`)?.riskCluster ?? null) &&
+                clusterGuards.get(
+                  candidateByKey.get(`${order.ticker.toUpperCase()}:${order.side === "yes" ? "YES" : "NO"}`)?.riskCluster ??
+                    "",
+                )?.triggered,
+            ),
+          }),
+        )
+    : [];
+  if (orderMaintenanceDecisions.length) {
+    await persistOrderMaintenanceDecisions({
+      runId,
+      mode,
+      decisions: orderMaintenanceDecisions,
+      source: "automation/order-maintenance",
+    }).catch(() => {
+      warnings.push("Storage warning: failed to persist order maintenance decisions.");
+    });
+  }
+  const orderMaintenanceHandledKeys = new Set<string>();
+  if (canExecuteLive && controls.orderMaintenanceEnabled) {
+    for (const decision of orderMaintenanceDecisions) {
+      if (decision.action === "KEEP") continue;
+      try {
+        await cancelKalshiDemoOrder(decision.orderId);
+        if (decision.action === "REPRICE" && decision.suggestedPriceCents !== null) {
+          const incumbentOrder = existingOrders.find((order) => order.order_id === decision.orderId);
+          if (incumbentOrder) {
+            const side: PredictionSide = incumbentOrder.side === "yes" ? "YES" : "NO";
+            const count = incumbentOrder.remaining_count ?? incumbentOrder.count;
+            await placeKalshiDemoOrder({
+              ticker: incumbentOrder.ticker,
+              side,
+              count,
+              limitPriceCents: decision.suggestedPriceCents,
+              contractStep: Math.max(0.01, count < 1 ? 0.01 : 1),
+              orderGroupId: incumbentOrder.order_group_id,
+              clientOrderId: buildAutomationClientOrderId(runId, { ticker: incumbentOrder.ticker, side }, 9000 + orderMaintenanceHandledKeys.size),
+            });
+            orderMaintenanceHandledKeys.add(`${incumbentOrder.ticker}:${side}`);
+          }
+        }
+      } catch (error) {
+        warnings.push(`Order maintenance ${decision.action.toLowerCase()} failed for ${decision.ticker}: ${(error as Error).message}`);
+      }
+    }
+  }
 
   function withRuntimeGateDiagnostics(candidate: PredictionCandidate): CandidateGateDiagnostic[] {
     return upsertGateDiagnostic(candidate.gateDiagnostics, {
@@ -4823,6 +5135,17 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   for (const [index, candidate] of executionQueue.entries()) {
     const key = candidateKey(candidate);
     const isActionable = actionableKeys.has(key);
+    if (orderMaintenanceHandledKeys.has(key)) {
+      executedCandidates.push({
+        ...candidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
+        ...executionMetadata,
+        simulated: !canExecuteLive,
+        executionStatus: "SKIPPED",
+        executionMessage: "Handled by stale-order maintenance reprice path.",
+      });
+      continue;
+    }
     if (!isActionable) {
       const minExecutableContracts = candidateContractStep(candidate);
       const nonActionReason =
@@ -4919,6 +5242,9 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     }
 
     try {
+      if (candidate.incumbentComparison?.accepted && candidate.incumbentComparison.action === "REPLACE_ORDER" && candidate.incumbentComparison.incumbentOrderId) {
+        await cancelKalshiDemoOrder(candidate.incumbentComparison.incumbentOrderId);
+      }
       const clientOrderId = buildAutomationClientOrderId(runId, candidate, index);
       const placement = await placeKalshiDemoOrder({
         ticker: candidate.ticker,
@@ -4972,6 +5298,24 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }).catch(() => {
     warnings.push("Storage warning: failed to persist executed candidate decisions.");
   });
+  const signalOverlays = executedCandidates
+    .filter((candidate) => candidate.silentClock || candidate.leadLag)
+    .map((candidate) => ({
+      ticker: candidate.ticker,
+      side: candidate.side,
+      silentClock: candidate.silentClock,
+      leadLag: candidate.leadLag,
+    }));
+  if (signalOverlays.length) {
+    await persistSignalOverlays({
+      runId,
+      mode,
+      overlays: signalOverlays,
+      source: "automation/signal-overlays",
+    }).catch(() => {
+      warnings.push("Storage warning: failed to persist signal overlays.");
+    });
+  }
 
   const finalBalances = await getKalshiDemoBalancesUsd().catch(() => ({ cashUsd: null, portfolioUsd: null }));
   await persistKalshiBalanceSnapshot({

@@ -93,6 +93,13 @@ interface StreamSummarySnapshot extends StreamPrivateStateSnapshot {
   error: string | null;
 }
 
+interface StreamHistoryPoint {
+  recordedAt: string;
+  yesBid: number | null;
+  yesAsk: number | null;
+  lastPrice: number | null;
+}
+
 function toNumber(value: unknown): number | null {
   return parseKalshiNumber(value);
 }
@@ -323,6 +330,7 @@ class KalshiStreamService {
   private fills = new Map<string, KalshiFillLite>();
   private positions = new Map<string, KalshiPositionLite>();
   private orderGroups = new Map<string, KalshiOrderGroupLite>();
+  private recentHistory = new Map<string, StreamHistoryPoint[]>();
   private streamEventBuffer: StoredKalshiStreamEvent[] = [];
   private streamPersistTimer: NodeJS.Timeout | null = null;
   private streamPersistPromise: Promise<void> = Promise.resolve();
@@ -524,6 +532,13 @@ class KalshiStreamService {
     }
   }
 
+  private recordMarketHistory(ticker: string, point: StreamHistoryPoint) {
+    const bucket = this.recentHistory.get(ticker) ?? [];
+    bucket.push(point);
+    while (bucket.length > 24) bucket.shift();
+    this.recentHistory.set(ticker, bucket);
+  }
+
   private upsertMarket(partial: Partial<PredictionMarketQuote> & Pick<PredictionMarketQuote, "ticker">) {
     const ticker = partial.ticker.toUpperCase();
     const existing = this.marketStates.get(ticker);
@@ -600,6 +615,15 @@ class KalshiStreamService {
       yesAskSize: no.size,
       noAskSize: yes.size,
     });
+    const refreshed = this.marketStates.get(ticker)?.market;
+    if (refreshed) {
+      this.recordMarketHistory(ticker, {
+        recordedAt: new Date().toISOString(),
+        yesBid: refreshed.yesBid,
+        yesAsk: refreshed.yesAsk,
+        lastPrice: refreshed.lastPrice,
+      });
+    }
   }
 
   private applyTickerMessage(message: Record<string, unknown>) {
@@ -632,6 +656,15 @@ class KalshiStreamService {
             ? false
             : undefined,
     });
+    const refreshed = this.marketStates.get(ticker)?.market;
+    if (refreshed) {
+      this.recordMarketHistory(ticker, {
+        recordedAt: new Date().toISOString(),
+        yesBid: refreshed.yesBid,
+        yesAsk: refreshed.yesAsk,
+        lastPrice: refreshed.lastPrice,
+      });
+    }
   }
 
   private applyOrderbookSnapshot(message: Record<string, unknown>) {
@@ -1252,6 +1285,15 @@ class KalshiStreamService {
     };
   }
 
+  getRecentHistory(tickers: string[] = []) {
+    if (!tickers.length) return new Map(this.recentHistory);
+    return new Map(
+      tickers
+        .map((ticker) => [ticker.toUpperCase(), this.recentHistory.get(ticker.toUpperCase())] as const)
+        .filter((entry): entry is [string, StreamHistoryPoint[]] => Boolean(entry[1])),
+    );
+  }
+
   getStatus(): KalshiStreamStatus {
     return {
       connected: Boolean(this.socket && this.socket.readyState === WebSocket.OPEN),
@@ -1353,4 +1395,8 @@ export async function getKalshiLiveSummaryStream(quoteTickers: string[] = []): P
 
 export function getKalshiStreamStatus() {
   return streamService.getStatus();
+}
+
+export function getKalshiRecentMarketHistoryStream(tickers: string[] = []) {
+  return streamService.getRecentHistory(tickers);
 }

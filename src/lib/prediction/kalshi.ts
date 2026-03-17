@@ -591,6 +591,39 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
   throw new Error(`Kalshi order failed with invalid parameters. | ${context}`);
 }
 
+async function kalshiOrderMutation(
+  paths: string[],
+  initFactory: (path: string) => RequestInit,
+): Promise<Record<string, unknown>> {
+  let lastError: Error | null = null;
+  for (const path of paths) {
+    try {
+      return await kalshiRequest<Record<string, unknown>>(path, initFactory(path), true);
+    } catch (error) {
+      lastError = error as Error;
+      const message = lastError.message.toLowerCase();
+      if (!message.includes("404") && !message.includes("405")) {
+        throw error;
+      }
+    }
+  }
+  throw lastError ?? new Error("Kalshi order mutation failed.");
+}
+
+export async function cancelKalshiDemoOrder(orderId: string) {
+  const encoded = encodeURIComponent(orderId);
+  return kalshiOrderMutation(
+    [
+      `/portfolio/orders/${encoded}/cancel`,
+      `/portfolio/orders/${encoded}`,
+    ],
+    (path) => ({
+      method: path.endsWith("/cancel") ? "POST" : "DELETE",
+      body: path.endsWith("/cancel") ? JSON.stringify({}) : undefined,
+    }),
+  );
+}
+
 function parseKalshiSide(raw: unknown): "yes" | "no" {
   const side = String(raw ?? "").toLowerCase();
   return side === "no" ? "no" : "yes";

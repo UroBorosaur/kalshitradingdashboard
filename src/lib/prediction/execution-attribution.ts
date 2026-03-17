@@ -4,20 +4,32 @@ import {
   readStoredBalancesSince,
   readStoredCandidateDecisionsSince,
   readStoredFillsSince,
+  readStoredLearningOutputsSince,
+  readStoredLiquidationDecisionsSince,
   readStoredMarkoutsSince,
+  readStoredOrderActionsSince,
   readStoredOrdersSince,
   readStoredQuotesSince,
+  readStoredReplacementDecisionsSince,
   readStoredResolutionsSince,
+  readStoredSignalOverlaysSince,
+  readStoredWatchlistEventsSince,
 } from "@/lib/storage/prediction-store";
 import type {
   PredictionStorageEnvelope,
   StoredKalshiBalanceEvent,
   StoredCandidateDecisionEvent,
+  StoredLearningOutputEvent,
   StoredKalshiFillEvent,
+  StoredLiquidationDecisionEvent,
   StoredKalshiOrderEvent,
   StoredMarkoutEvent,
+  StoredOrderMaintenanceEvent,
   StoredKalshiQuoteEvent,
+  StoredReplacementDecisionEvent,
   StoredResolutionEvent,
+  StoredSignalOverlayEvent,
+  StoredWatchlistEvent,
 } from "@/lib/storage/types";
 import type {
   CandidateGateKey,
@@ -56,6 +68,12 @@ interface SummarizeExecutionAttributionArgs {
   fills: Array<PredictionStorageEnvelope<StoredKalshiFillEvent>>;
   balances: Array<PredictionStorageEnvelope<StoredKalshiBalanceEvent>>;
   quotes: Array<PredictionStorageEnvelope<StoredKalshiQuoteEvent>>;
+  replacements: Array<PredictionStorageEnvelope<StoredReplacementDecisionEvent>>;
+  orderActions: Array<PredictionStorageEnvelope<StoredOrderMaintenanceEvent>>;
+  watchlistEvents: Array<PredictionStorageEnvelope<StoredWatchlistEvent>>;
+  learningOutputs: Array<PredictionStorageEnvelope<StoredLearningOutputEvent>>;
+  liquidationDecisions: Array<PredictionStorageEnvelope<StoredLiquidationDecisionEvent>>;
+  signalOverlays: Array<PredictionStorageEnvelope<StoredSignalOverlayEvent>>;
   resolutions: Array<PredictionStorageEnvelope<StoredResolutionEvent>>;
   markouts: Array<PredictionStorageEnvelope<StoredMarkoutEvent>>;
 }
@@ -641,6 +659,12 @@ export function summarizeExecutionAttribution({
   fills,
   balances,
   quotes,
+  replacements,
+  orderActions,
+  watchlistEvents,
+  learningOutputs,
+  liquidationDecisions,
+  signalOverlays,
   resolutions,
   markouts,
 }: SummarizeExecutionAttributionArgs): ExecutionAttributionSummary {
@@ -1108,6 +1132,56 @@ export function summarizeExecutionAttribution({
       return (b.conversionRate ?? 0) - (a.conversionRate ?? 0);
     });
 
+  const replacementPayloads = replacements
+    .map((event) => event.payload)
+    .sort((a, b) => b.replacementScoreDelta - a.replacementScoreDelta);
+  const replacementAccepted = replacementPayloads.filter((decision) => decision.accepted);
+  const replacementRejected = replacementPayloads.filter((decision) => !decision.accepted);
+
+  const orderMaintenancePayloads = orderActions
+    .map((event) => event.payload)
+    .sort((a, b) => b.expectedImprovement - a.expectedImprovement);
+  const watchlistPayloads = [...watchlistEvents].sort(
+    (a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
+  );
+  const latestWatchlistByKey = new Map<string, PredictionStorageEnvelope<StoredWatchlistEvent>>();
+  for (const event of watchlistPayloads) {
+    if (!latestWatchlistByKey.has(event.payload.key)) {
+      latestWatchlistByKey.set(event.payload.key, event);
+    }
+  }
+  const promotedWatchlistKeys = new Set(
+    watchlistPayloads.filter((event) => event.payload.type === "PROMOTED").map((event) => event.payload.key),
+  );
+  const resolvedWatchlistSamples = [...latestWatchlistByKey.values()]
+    .map((event) => {
+      const resolution = resolutionByTicker.get(event.payload.ticker)?.payload;
+      const settlementMark = settlementMarkForDecision(resolution, event.payload.side);
+      return {
+        promoted: promotedWatchlistKeys.has(event.payload.key),
+        resolved: settlementMark !== null,
+        hit: settlementMark !== null ? settlementMark > 0.5 : false,
+      };
+    })
+    .filter((sample) => sample.resolved);
+  const promotedResolved = resolvedWatchlistSamples.filter((sample) => sample.promoted);
+  const neverPromotedResolved = resolvedWatchlistSamples.filter((sample) => !sample.promoted);
+
+  const latestLearningOutput = [...learningOutputs].sort(
+    (a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
+  )[0]?.payload;
+
+  const liquidationPayloads = liquidationDecisions
+    .map((event) => event.payload)
+    .sort((a, b) => (b.valueExitNowUsd - b.valueHoldToResolutionUsd) - (a.valueExitNowUsd - a.valueHoldToResolutionUsd));
+
+  const silentClockPayloads = signalOverlays
+    .map((event) => event.payload.silentClock)
+    .filter((payload): payload is NonNullable<StoredSignalOverlayEvent["silentClock"]> => Boolean(payload));
+  const leadLagPayloads = signalOverlays
+    .map((event) => event.payload.leadLag)
+    .filter((payload): payload is NonNullable<StoredSignalOverlayEvent["leadLag"]> => Boolean(payload));
+
   return {
     generatedAt: new Date().toISOString(),
     lookbackHours,
@@ -1133,6 +1207,80 @@ export function summarizeExecutionAttribution({
     byToxicity: finalizeBuckets(byToxicity, bucketLimit),
     byBootstrap: finalizeBuckets(byBootstrap, bucketLimit),
     recentTrades: trades.slice(0, clamp(recentTradeLimit, 1, 30)),
+    replacement: {
+      accepted: replacementAccepted.length,
+      rejected: replacementRejected.length,
+      avgScoreDelta: average(
+        replacementPayloads.reduce((sum, decision) => sum + decision.replacementScoreDelta, 0),
+        replacementPayloads.length,
+      ),
+      avgReplacementCost: average(
+        replacementPayloads.reduce((sum, decision) => sum + decision.replacementCost + decision.queueResetPenalty, 0),
+        replacementPayloads.length,
+      ),
+      recent: replacementPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
+    },
+    orderMaintenance: {
+      keep: orderMaintenancePayloads.filter((decision) => decision.action === "KEEP").length,
+      reprice: orderMaintenancePayloads.filter((decision) => decision.action === "REPRICE").length,
+      cancel: orderMaintenancePayloads.filter((decision) => decision.action === "CANCEL").length,
+      avgExpectedImprovement: average(
+        orderMaintenancePayloads.reduce((sum, decision) => sum + decision.expectedImprovement, 0),
+        orderMaintenancePayloads.length,
+      ),
+      recent: orderMaintenancePayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
+    },
+    watchlist: {
+      active: latestWatchlistByKey.size,
+      promotions: promotedWatchlistKeys.size,
+      avgWatchlistHours: average(
+        [...latestWatchlistByKey.values()].reduce((sum, event) => sum + (event.payload.avgWatchlistHours ?? 0), 0),
+        latestWatchlistByKey.size,
+      ),
+      promotedResolvedCount: promotedResolved.length,
+      promotedHitRate: average(promotedResolved.filter((sample) => sample.hit).length, promotedResolved.length),
+      neverPromotedResolvedCount: neverPromotedResolved.length,
+      neverPromotedHitRate: average(
+        neverPromotedResolved.filter((sample) => sample.hit).length,
+        neverPromotedResolved.length,
+      ),
+      recent: watchlistPayloads.slice(0, clamp(recentTradeLimit, 1, 30)).map((event) => event.payload),
+    },
+    learning:
+      latestLearningOutput ??
+      ({
+        generatedAt: new Date().toISOString(),
+        lookbackHours,
+        active: false,
+        recommendations: [],
+      } satisfies ExecutionAttributionSummary["learning"]),
+    liquidation: {
+      hold: liquidationPayloads.filter((decision) => decision.action === "HOLD").length,
+      trim: liquidationPayloads.filter((decision) => decision.action === "TRIM").length,
+      flatten: liquidationPayloads.filter((decision) => decision.action === "FLATTEN").length,
+      avgExitEdgeUsd: average(
+        liquidationPayloads.reduce(
+          (sum, decision) => sum + (decision.valueExitNowUsd - decision.valueHoldToResolutionUsd),
+          0,
+        ),
+        liquidationPayloads.length,
+      ),
+      recent: liquidationPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
+    },
+    overlays: {
+      silentClockCount: silentClockPayloads.length,
+      leadLagCount: leadLagPayloads.length,
+      avgSilentClockPenalty: average(
+        silentClockPayloads.reduce((sum, overlay) => sum + overlay.decayPenalty, 0),
+        silentClockPayloads.length,
+      ),
+      avgLeadLagSignal: average(
+        leadLagPayloads.reduce((sum, overlay) => sum + overlay.signalMagnitude, 0),
+        leadLagPayloads.length,
+      ),
+      recentSilentClock: silentClockPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
+      recentLeadLag: leadLagPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
+    },
     selectionControl: {
       executed: {
         count: placedExecutedDecisions.length,
@@ -1176,12 +1324,32 @@ export async function loadExecutionAttributionSummary(args?: {
 }): Promise<ExecutionAttributionSummary> {
   const lookbackHours = clamp(args?.lookbackHours ?? DEFAULT_LOOKBACK_HOURS, 1, 24 * 30);
   const sinceMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  const [decisions, orders, fills, balances, quotes, resolutions, markouts] = await Promise.all([
+  const [
+    decisions,
+    orders,
+    fills,
+    balances,
+    quotes,
+    replacements,
+    orderActions,
+    watchlistEvents,
+    learningOutputs,
+    liquidationDecisions,
+    signalOverlays,
+    resolutions,
+    markouts,
+  ] = await Promise.all([
     readStoredCandidateDecisionsSince(sinceMs),
     readStoredOrdersSince(sinceMs),
     readStoredFillsSince(sinceMs),
     readStoredBalancesSince(sinceMs),
     readStoredQuotesSince(sinceMs),
+    readStoredReplacementDecisionsSince(sinceMs),
+    readStoredOrderActionsSince(sinceMs),
+    readStoredWatchlistEventsSince(sinceMs),
+    readStoredLearningOutputsSince(sinceMs),
+    readStoredLiquidationDecisionsSince(sinceMs),
+    readStoredSignalOverlaysSince(sinceMs),
     readStoredResolutionsSince(sinceMs),
     readStoredMarkoutsSince(sinceMs),
   ]);
@@ -1195,6 +1363,12 @@ export async function loadExecutionAttributionSummary(args?: {
     fills,
     balances,
     quotes,
+    replacements,
+    orderActions,
+    watchlistEvents,
+    learningOutputs,
+    liquidationDecisions,
+    signalOverlays,
     resolutions,
     markouts,
   });

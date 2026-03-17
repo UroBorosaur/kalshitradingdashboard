@@ -15,27 +15,40 @@ import type {
   PredictionReplayEvent,
   PredictionStorageEnvelope,
   StoredCandidateDecisionEvent,
+  StoredLearningOutputEvent,
   StoredKalshiBalanceEvent,
   StoredKalshiFillEvent,
+  StoredLiquidationDecisionEvent,
   StoredKalshiOrderEvent,
   StoredKalshiPositionEvent,
   StoredKalshiQuoteEvent,
   StoredKalshiStreamEvent,
   StoredMarkoutEvent,
   StoredOrderbookEvent,
+  StoredOrderMaintenanceEvent,
+  StoredReplacementDecisionEvent,
   StoredResolutionEvent,
+  StoredSignalOverlayEvent,
   StoredShadowBaselineEvent,
+  StoredWatchlistEvent,
 } from "@/lib/storage/types";
 import { toStoredCandidateDecisionPayload } from "@/lib/storage/types";
 import type {
   AutomationMode,
+  FalseNegativeLearningOutput,
   KalshiFillLite,
   KalshiOrderLite,
   KalshiPositionLite,
   KalshiQuoteLite,
+  LiquidationDecision,
+  OrderMaintenanceDecision,
   PredictionCandidate,
   PredictionMarketQuote,
+  ReplacementDecision,
   ShadowBaselineSummary,
+  SilentClockContribution,
+  LeadLagSignal,
+  WatchlistEvent,
 } from "@/lib/prediction/types";
 
 const SCHEMA_VERSION = 1;
@@ -519,6 +532,145 @@ export async function persistShadowBaselines(args: {
   await appendPredictionEvents("raw", "shadow_baselines", events);
 }
 
+export async function persistReplacementDecisions(args: {
+  runId: string;
+  mode: AutomationMode;
+  decisions: ReplacementDecision[];
+  source: string;
+}) {
+  const events = args.decisions.map((decision) =>
+    makeEnvelope<StoredReplacementDecisionEvent>(
+      "replacement_decisions",
+      "raw",
+      args.source,
+      `replacement:${args.runId}:${decision.candidateKey}:${decision.incumbentSource}:${decision.incumbentOrderId ?? decision.incumbentTicker}`,
+      {
+        ...decision,
+        runId: args.runId,
+        mode: args.mode,
+      },
+    ),
+  );
+  await appendPredictionEvents("raw", "replacement_decisions", events);
+}
+
+export async function persistOrderMaintenanceDecisions(args: {
+  runId: string;
+  mode: AutomationMode;
+  decisions: OrderMaintenanceDecision[];
+  source: string;
+}) {
+  const events = args.decisions.map((decision) =>
+    makeEnvelope<StoredOrderMaintenanceEvent>(
+      "order_actions",
+      "raw",
+      args.source,
+      `order-action:${args.runId}:${decision.orderId}:${decision.action}`,
+      {
+        ...decision,
+        runId: args.runId,
+        mode: args.mode,
+      },
+    ),
+  );
+  await appendPredictionEvents("raw", "order_actions", events);
+}
+
+export async function persistWatchlistEvents(args: {
+  events: WatchlistEvent[];
+  source: string;
+  runId?: string;
+  mode?: AutomationMode;
+}) {
+  const events = args.events.map((event, index) =>
+    makeEnvelope<StoredWatchlistEvent>(
+      "watchlist_events",
+      "raw",
+      args.source,
+      `watchlist:${event.key}:${event.type}:${args.runId ?? "na"}:${index}`,
+      {
+        ...event,
+        runId: args.runId,
+        mode: args.mode,
+      },
+    ),
+  );
+  await appendPredictionEvents("raw", "watchlist_events", events);
+}
+
+export async function persistLearningOutput(args: {
+  output: FalseNegativeLearningOutput;
+  source: string;
+  runId?: string;
+  mode?: AutomationMode;
+}) {
+  await appendPredictionEvents("raw", "learning_outputs", [
+    makeEnvelope<StoredLearningOutputEvent>(
+      "learning_outputs",
+      "raw",
+      args.source,
+      `learning:${args.runId ?? "na"}:${new Date(args.output.generatedAt).toISOString()}`,
+      {
+        ...args.output,
+        runId: args.runId,
+        mode: args.mode,
+      },
+    ),
+  ]);
+}
+
+export async function persistLiquidationDecisions(args: {
+  runId: string;
+  mode: AutomationMode;
+  decisions: LiquidationDecision[];
+  source: string;
+}) {
+  const events = args.decisions.map((decision) =>
+    makeEnvelope<StoredLiquidationDecisionEvent>(
+      "liquidation_decisions",
+      "raw",
+      args.source,
+      `liquidation:${args.runId}:${decision.ticker}:${decision.side}`,
+      {
+        ...decision,
+        runId: args.runId,
+        mode: args.mode,
+      },
+    ),
+  );
+  await appendPredictionEvents("raw", "liquidation_decisions", events);
+}
+
+export async function persistSignalOverlays(args: {
+  runId: string;
+  mode: AutomationMode;
+  overlays: Array<{
+    ticker: string;
+    side: "YES" | "NO";
+    silentClock?: SilentClockContribution;
+    leadLag?: LeadLagSignal;
+  }>;
+  source: string;
+}) {
+  const events = args.overlays.map((overlay, index) =>
+    makeEnvelope<StoredSignalOverlayEvent>(
+      "signal_overlays",
+      "raw",
+      args.source,
+      `signal:${args.runId}:${overlay.ticker}:${overlay.side}:${index}`,
+      {
+        runId: args.runId,
+        mode: args.mode,
+        ticker: overlay.ticker,
+        side: overlay.side,
+        silentClock: overlay.silentClock,
+        leadLag: overlay.leadLag,
+      },
+    ),
+  );
+  await appendPredictionEvents("raw", "signal_overlays", events);
+}
+
 export async function persistStreamEvents(args: {
   source: string;
   events: StoredKalshiStreamEvent[];
@@ -563,6 +715,30 @@ export async function readStoredShadowBaselinesSince(sinceMs: number) {
   return readPredictionEventsSince<StoredShadowBaselineEvent>("raw", "shadow_baselines", sinceMs);
 }
 
+export async function readStoredReplacementDecisionsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredReplacementDecisionEvent>("raw", "replacement_decisions", sinceMs);
+}
+
+export async function readStoredOrderActionsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredOrderMaintenanceEvent>("raw", "order_actions", sinceMs);
+}
+
+export async function readStoredWatchlistEventsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredWatchlistEvent>("raw", "watchlist_events", sinceMs);
+}
+
+export async function readStoredLearningOutputsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredLearningOutputEvent>("raw", "learning_outputs", sinceMs);
+}
+
+export async function readStoredLiquidationDecisionsSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredLiquidationDecisionEvent>("raw", "liquidation_decisions", sinceMs);
+}
+
+export async function readStoredSignalOverlaysSince(sinceMs: number) {
+  return readPredictionEventsSince<StoredSignalOverlayEvent>("raw", "signal_overlays", sinceMs);
+}
+
 export async function readStoredResolutionsSince(sinceMs: number) {
   return readPredictionEventsSince<StoredResolutionEvent>("raw", "resolutions", sinceMs);
 }
@@ -594,6 +770,12 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     orderbookEvents,
     candidateDecisions,
     shadowBaselines,
+    replacementDecisions,
+    orderActions,
+    watchlistEvents,
+    learningOutputs,
+    liquidationDecisions,
+    signalOverlays,
     resolutions,
     markouts,
   ] = await Promise.all([
@@ -606,6 +788,12 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     readPredictionEventsForDay<StoredOrderbookEvent>("raw", "orderbook_events", day),
     readPredictionEventsForDay<StoredCandidateDecisionEvent>("raw", "candidate_decisions", day),
     readPredictionEventsForDay<StoredShadowBaselineEvent>("raw", "shadow_baselines", day),
+    readPredictionEventsForDay<StoredReplacementDecisionEvent>("raw", "replacement_decisions", day),
+    readPredictionEventsForDay<StoredOrderMaintenanceEvent>("raw", "order_actions", day),
+    readPredictionEventsForDay<StoredWatchlistEvent>("raw", "watchlist_events", day),
+    readPredictionEventsForDay<StoredLearningOutputEvent>("raw", "learning_outputs", day),
+    readPredictionEventsForDay<StoredLiquidationDecisionEvent>("raw", "liquidation_decisions", day),
+    readPredictionEventsForDay<StoredSignalOverlayEvent>("raw", "signal_overlays", day),
     readPredictionEventsForDay<StoredResolutionEvent>("raw", "resolutions", day),
     readPredictionEventsForDay<StoredMarkoutEvent>("derived", "markouts", day),
   ]);
@@ -620,6 +808,12 @@ export async function loadPredictionReplayDay(day: string): Promise<PredictionRe
     orderbookEvents,
     candidateDecisions,
     shadowBaselines,
+    replacementDecisions,
+    orderActions,
+    watchlistEvents,
+    learningOutputs,
+    liquidationDecisions,
+    signalOverlays,
     resolutions,
     markouts,
   };
@@ -635,8 +829,14 @@ const REPLAY_STREAM_ORDER: Record<PredictionReplayEvent["stream"], number> = {
   orderbook_events: 6,
   candidate_decisions: 7,
   shadow_baselines: 8,
-  resolutions: 9,
-  markouts: 10,
+  replacement_decisions: 9,
+  order_actions: 10,
+  watchlist_events: 11,
+  learning_outputs: 12,
+  liquidation_decisions: 13,
+  signal_overlays: 14,
+  resolutions: 15,
+  markouts: 16,
 };
 
 function compareReplayEvents(a: PredictionReplayEvent, b: PredictionReplayEvent) {
@@ -666,6 +866,12 @@ export async function loadPredictionReplayTimeline(day: string): Promise<Predict
     ...replayDay.orderbookEvents,
     ...replayDay.candidateDecisions,
     ...replayDay.shadowBaselines,
+    ...replayDay.replacementDecisions,
+    ...replayDay.orderActions,
+    ...replayDay.watchlistEvents,
+    ...replayDay.learningOutputs,
+    ...replayDay.liquidationDecisions,
+    ...replayDay.signalOverlays,
     ...replayDay.resolutions,
     ...replayDay.markouts,
   ].sort(compareReplayEvents);

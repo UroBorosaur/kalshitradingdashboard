@@ -4,13 +4,19 @@ import test from "node:test";
 import { summarizeExecutionAttribution } from "@/lib/prediction/execution-attribution";
 import type {
   PredictionStorageEnvelope,
+  StoredLearningOutputEvent,
   StoredCandidateDecisionEvent,
   StoredKalshiBalanceEvent,
   StoredKalshiFillEvent,
+  StoredLiquidationDecisionEvent,
+  StoredOrderMaintenanceEvent,
   StoredKalshiOrderEvent,
   StoredKalshiQuoteEvent,
   StoredMarkoutEvent,
+  StoredReplacementDecisionEvent,
   StoredResolutionEvent,
+  StoredSignalOverlayEvent,
+  StoredWatchlistEvent,
 } from "@/lib/storage/types";
 
 function envelope<TPayload>(
@@ -143,7 +149,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
         executeRequested: true,
         ticker: "MISS",
         title: "Near Miss Market",
-        category: "CRYPTO",
+        category: "BITCOIN",
         side: "YES",
         verdict: "WATCHLIST",
         marketProb: 0.41,
@@ -158,7 +164,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
         calibrationMethod: "TEMPERATURE",
         expertWeights: [{ expert: "MICROSTRUCTURE", weight: 0.55, probability: 0.5 }],
         compositeScore: 0.009,
-        riskCluster: "CRYPTO:MISS",
+        riskCluster: "BITCOIN:MISS",
         gateDiagnostics: [
           {
             gate: "POSITION_ORDER_CONFLICT",
@@ -421,6 +427,180 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     ),
   ];
 
+  const replacements = [
+    envelope<StoredReplacementDecisionEvent>(
+      "replacement_decisions",
+      "automation/conflict-replacements",
+      "replacement:MISS",
+      {
+        runId: "run-3",
+        mode: "AI",
+        candidateKey: "MISS:YES",
+        ticker: "MISS",
+        title: "Near Miss Market",
+        category: "OTHER",
+        side: "YES",
+        incumbentSource: "ORDER",
+        incumbentConflictType: "SAME_SIDE_ORDER",
+        incumbentTicker: "MISS",
+        incumbentSide: "YES",
+        incumbentOrderId: "order-blocker",
+        incumbentUtility: 0.02,
+        challengerUtility: 0.06,
+        replacementCost: 0.005,
+        queueResetPenalty: 0.003,
+        additionalClusterRiskPenalty: 0.002,
+        replacementScoreDelta: 0.03,
+        threshold: 0.02,
+        accepted: true,
+        action: "REPLACE_ORDER",
+        reason: "Challenger dominates incumbent.",
+        clusterKey: "BITCOIN:MISS",
+      },
+    ),
+  ];
+
+  const orderActions = [
+    envelope<StoredOrderMaintenanceEvent>(
+      "order_actions",
+      "automation/order-maintenance",
+      "order-action:order-1",
+      {
+        runId: "run-1",
+        mode: "AI",
+        orderId: "order-1",
+        ticker: "TEST",
+        side: "YES",
+        action: "REPRICE",
+        currentPriceCents: 61,
+        suggestedPriceCents: 62,
+        evKeep: 0.01,
+        evReprice: 0.03,
+        evCancel: 0.005,
+        expectedImprovement: 0.02,
+        threshold: 0.01,
+        staleHazard: 0.2,
+        toxicityScore: 0.15,
+        reservationDrift: 0.01,
+        queueResetPenalty: 0.002,
+        challengerOpportunityUsd: 0.12,
+        reason: "Refresh the quote.",
+      },
+    ),
+  ];
+
+  const watchlistEvents = [
+    envelope<StoredWatchlistEvent>(
+      "watchlist_events",
+      "automation/watchlist",
+      "watchlist:MISS",
+      {
+        runId: "run-3",
+        mode: "AI",
+        key: "MISS:YES",
+        ticker: "MISS",
+        title: "Near Miss Market",
+        category: "OTHER",
+        side: "YES",
+        type: "PROMOTED",
+        promotionScore: 0.08,
+        avgWatchlistHours: 3,
+        edge: 0.04,
+        executionAdjustedEdge: 0.028,
+        confidence: 0.58,
+        reason: "Improved across cycles.",
+      },
+    ),
+  ];
+
+  const learningOutputs = [
+    envelope<StoredLearningOutputEvent>(
+      "learning_outputs",
+      "automation/learning",
+      "learning:latest",
+      {
+        generatedAt: "2026-03-16T13:00:00.000Z",
+        lookbackHours: 72,
+        active: false,
+        recommendations: [
+          {
+            gate: "CONFIDENCE_FLOOR",
+            label: "Confidence floor",
+            unit: "probability",
+            sampleCount: 4,
+            hitRate: 0.6,
+            profitableRate: 0.5,
+            avgCounterfactualPnlUsd: 0.42,
+            avgExpiryDrift: 0.03,
+            proposedDelta: 0.005,
+            boundedDelta: 0.005,
+            reason: "False negatives are moderately expensive.",
+            active: false,
+          },
+        ],
+      },
+    ),
+  ];
+
+  const liquidationDecisions = [
+    envelope<StoredLiquidationDecisionEvent>(
+      "liquidation_decisions",
+      "automation/liquidation",
+      "liquidation:TEST",
+      {
+        runId: "run-1",
+        mode: "AI",
+        ticker: "TEST",
+        title: "Test Market",
+        category: "SPORTS",
+        side: "YES",
+        contracts: 2,
+        canCloseEarly: true,
+        timeToResolutionDays: 0.05,
+        valueHoldToResolutionUsd: 0.08,
+        valueExitNowUsd: 0.21,
+        liquidationCostUsd: 0.02,
+        expectedMarkToResolution: 0.67,
+        spread: 0.02,
+        liquidityScore: 0.7,
+        liquidationCVaR: 0.03,
+        action: "FLATTEN",
+        reason: "Exit-now dominates.",
+      },
+    ),
+  ];
+
+  const signalOverlays = [
+    envelope<StoredSignalOverlayEvent>(
+      "signal_overlays",
+      "automation/signal-overlays",
+      "overlay:MISS",
+      {
+        runId: "run-3",
+        mode: "AI",
+        ticker: "MISS",
+        side: "YES",
+        silentClock: {
+          eligible: true,
+          checkpointProgress: 0.62,
+          decayPenalty: 0.03,
+          adjustedProbability: 0.46,
+          rationale: "No confirming event arrived by checkpoint.",
+        },
+        leadLag: {
+          leadTicker: "LEAD",
+          lagTicker: "MISS",
+          horizonSeconds: 120,
+          signalMagnitude: 0.02,
+          confidence: 0.5,
+          direction: "UP",
+          adjustedProbability: 0.5,
+          rationale: "Related market repriced first.",
+        },
+      },
+    ),
+  ];
+
   const summary = summarizeExecutionAttribution({
     lookbackHours: 72,
     decisions,
@@ -428,6 +608,12 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
     fills,
     balances,
     quotes,
+    replacements,
+    orderActions,
+    watchlistEvents,
+    learningOutputs,
+    liquidationDecisions,
+    signalOverlays,
     resolutions,
     markouts,
     recentTradeLimit: 10,
@@ -487,4 +673,11 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.selectionControl?.gateWaterfall.find((row) => row.gate === "CONFIDENCE_FLOOR")?.secondaryCount, 1);
   assert.equal(summary.selectionControl?.counterfactualByGate.find((row) => row.gate === "CONFIDENCE_FLOOR")?.additionalPasses, 1);
   assert.equal(summary.selectionControl?.counterfactualByGate.find((row) => row.gate === "EXECUTION_EDGE")?.additionalPasses, 0);
+  assert.equal(summary.replacement?.accepted, 1);
+  assert.equal(summary.orderMaintenance?.reprice, 1);
+  assert.equal(summary.watchlist?.promotions, 1);
+  assert.equal(summary.learning?.recommendations[0]?.gate, "CONFIDENCE_FLOOR");
+  assert.equal(summary.liquidation?.flatten, 1);
+  assert.equal(summary.overlays?.silentClockCount, 1);
+  assert.equal(summary.overlays?.leadLagCount, 1);
 });

@@ -44,7 +44,178 @@ export type StrategyTag =
   | "SPARSEMAX_STRUCTURAL"
   | "ENTMAX_STRUCTURAL"
   | "MIXTURE_OF_EXPERTS"
-  | "TEMPERATURE_CALIBRATED";
+  | "TEMPERATURE_CALIBRATED"
+  | "SILENT_CLOCK_DECAY"
+  | "LEAD_LAG_OVERLAY";
+
+export type ReplacementDecisionAction = "KEEP_INCUMBENT" | "REPLACE_ORDER" | "RECOMMEND_POSITION_SWAP";
+export type OrderMaintenanceAction = "KEEP" | "REPRICE" | "CANCEL";
+export type WatchlistEventType = "ADDED" | "UPDATED" | "PROMOTED" | "RESOLVED" | "EXPIRED";
+export type LiquidationAction = "HOLD" | "TRIM" | "FLATTEN";
+
+export interface ReplacementDecision {
+  candidateKey: string;
+  ticker: string;
+  title: string;
+  category: PredictionCategory;
+  side: PredictionSide;
+  incumbentSource: "ORDER" | "POSITION";
+  incumbentConflictType: "SAME_SIDE_ORDER" | "MARKET_ORDER" | "SAME_SIDE_POSITION" | "MARKET_POSITION";
+  incumbentTicker: string;
+  incumbentSide: PredictionSide;
+  incumbentOrderId?: string;
+  incumbentUtility: number;
+  challengerUtility: number;
+  replacementCost: number;
+  queueResetPenalty: number;
+  additionalClusterRiskPenalty: number;
+  replacementScoreDelta: number;
+  threshold: number;
+  accepted: boolean;
+  action: ReplacementDecisionAction;
+  reason: string;
+  clusterKey?: string;
+}
+
+export interface OrderMaintenanceDecision {
+  orderId: string;
+  ticker: string;
+  title?: string;
+  category?: PredictionCategory;
+  side: PredictionSide;
+  orderGroupId?: string;
+  action: OrderMaintenanceAction;
+  currentPriceCents: number | null;
+  suggestedPriceCents: number | null;
+  evKeep: number;
+  evReprice: number;
+  evCancel: number;
+  expectedImprovement: number;
+  threshold: number;
+  staleHazard: number;
+  toxicityScore: number;
+  reservationDrift: number;
+  queueResetPenalty: number;
+  challengerOpportunityUsd: number;
+  reason: string;
+  riskCluster?: string;
+}
+
+export interface WatchlistState {
+  key: string;
+  ticker: string;
+  title: string;
+  category: PredictionCategory;
+  side: PredictionSide;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  cyclesObserved: number;
+  bestEdge: number;
+  bestExecutionAdjustedEdge: number;
+  bestConfidence: number;
+  bestCompositeScore: number | null;
+  lastMarketProb: number;
+  lastQuoteDrift: number | null;
+  lastToxicity: number | null;
+  lastUncertainty: number | null;
+  blockingReasons: string[];
+  failedGates: CandidateGateDiagnostic[];
+  promotedCount: number;
+  lastPromotionAt?: string;
+  resolved: boolean;
+}
+
+export interface WatchlistEvent {
+  key: string;
+  ticker: string;
+  title: string;
+  category: PredictionCategory;
+  side: PredictionSide;
+  type: WatchlistEventType;
+  promotionScore?: number;
+  avgWatchlistHours?: number;
+  quoteDrift?: number | null;
+  edge?: number;
+  executionAdjustedEdge?: number | null;
+  confidence?: number;
+  toxicityScore?: number | null;
+  uncertaintyWidth?: number | null;
+  failedGates?: CandidateGateDiagnostic[];
+  blockingReasons?: string[];
+  reason: string;
+}
+
+export interface WatchlistPromotionDecision {
+  key: string;
+  ticker: string;
+  side: PredictionSide;
+  promotionScore: number;
+  threshold: number;
+  promoted: boolean;
+  reason: string;
+  avgWatchlistHours: number;
+}
+
+export interface GateLearningRecommendation {
+  gate: CandidateGateKey;
+  label: string;
+  unit: "probability" | "usd" | "count" | "severity";
+  sampleCount: number;
+  hitRate: number | null;
+  profitableRate: number | null;
+  avgCounterfactualPnlUsd: number | null;
+  avgExpiryDrift: number | null;
+  proposedDelta: number;
+  boundedDelta: number;
+  reason: string;
+  active: boolean;
+}
+
+export interface FalseNegativeLearningOutput {
+  generatedAt: string;
+  lookbackHours: number;
+  active: boolean;
+  recommendations: GateLearningRecommendation[];
+}
+
+export interface LiquidationDecision {
+  ticker: string;
+  title: string;
+  category: PredictionCategory;
+  side: PredictionSide;
+  contracts: number;
+  riskCluster?: string;
+  canCloseEarly: boolean;
+  timeToResolutionDays: number;
+  valueHoldToResolutionUsd: number;
+  valueExitNowUsd: number;
+  liquidationCostUsd: number;
+  expectedMarkToResolution: number;
+  spread: number;
+  liquidityScore: number;
+  liquidationCVaR: number;
+  action: LiquidationAction;
+  reason: string;
+}
+
+export interface SilentClockContribution {
+  eligible: boolean;
+  checkpointProgress: number;
+  decayPenalty: number;
+  adjustedProbability: number;
+  rationale: string;
+}
+
+export interface LeadLagSignal {
+  leadTicker: string;
+  lagTicker: string;
+  horizonSeconds: number;
+  signalMagnitude: number;
+  confidence: number;
+  direction: "UP" | "DOWN";
+  adjustedProbability: number;
+  rationale: string;
+}
 
 export interface CandidateGateDiagnostic {
   gate: CandidateGateKey;
@@ -128,6 +299,18 @@ export interface PredictionCandidate {
   uncertaintyWidth?: number;
   toxicityScore?: number;
   riskCluster?: string;
+  incumbentComparison?: ReplacementDecision;
+  replacementScoreDelta?: number;
+  watchlistState?: {
+    status: "ACTIVE" | "PROMOTED" | "RESOLVED";
+    ageHours: number;
+    cyclesObserved: number;
+    promotionScore?: number;
+  };
+  silentClock?: SilentClockContribution;
+  leadLag?: LeadLagSignal;
+  liquidationRecommendation?: LiquidationDecision;
+  orderMaintenance?: OrderMaintenanceDecision;
   executionPlan?: {
     limitPriceCents: number;
     patienceHours: number;
@@ -275,6 +458,50 @@ export interface ShadowBaselineSummary {
   adverseSelectionRate: number | null;
   topTickers: string[];
   notes: string[];
+}
+
+export interface ReplacementAttributionSummary {
+  accepted: number;
+  rejected: number;
+  avgScoreDelta: number | null;
+  avgReplacementCost: number | null;
+  recent: ReplacementDecision[];
+}
+
+export interface OrderMaintenanceAttributionSummary {
+  keep: number;
+  reprice: number;
+  cancel: number;
+  avgExpectedImprovement: number | null;
+  recent: OrderMaintenanceDecision[];
+}
+
+export interface WatchlistAttributionSummary {
+  active: number;
+  promotions: number;
+  avgWatchlistHours: number | null;
+  promotedResolvedCount: number;
+  promotedHitRate: number | null;
+  neverPromotedResolvedCount: number;
+  neverPromotedHitRate: number | null;
+  recent: WatchlistEvent[];
+}
+
+export interface LiquidationAttributionSummary {
+  hold: number;
+  trim: number;
+  flatten: number;
+  avgExitEdgeUsd: number | null;
+  recent: LiquidationDecision[];
+}
+
+export interface SignalOverlayAttributionSummary {
+  silentClockCount: number;
+  leadLagCount: number;
+  avgSilentClockPenalty: number | null;
+  avgLeadLagSignal: number | null;
+  recentSilentClock: SilentClockContribution[];
+  recentLeadLag: LeadLagSignal[];
 }
 
 export interface AutomationRunSummary {
@@ -427,6 +654,12 @@ export interface ExecutionAttributionSummary {
   byToxicity: ExecutionAttributionBucket[];
   byBootstrap: ExecutionAttributionBucket[];
   recentTrades: ExecutionAttributionTrade[];
+  replacement?: ReplacementAttributionSummary;
+  orderMaintenance?: OrderMaintenanceAttributionSummary;
+  watchlist?: WatchlistAttributionSummary;
+  learning?: FalseNegativeLearningOutput;
+  liquidation?: LiquidationAttributionSummary;
+  overlays?: SignalOverlayAttributionSummary;
   selectionControl?: {
     executed: {
       count: number;
@@ -498,6 +731,14 @@ export interface AutomationControls {
   favoriteLongshotEnabled: boolean;
   throughputRecoveryEnabled: boolean;
   exploratoryFallbackEnabled: boolean;
+  replacementEnabled: boolean;
+  replacementMinDelta: number;
+  orderMaintenanceEnabled: boolean;
+  cancelReplaceMinImprovement: number;
+  watchlistPromotionEnabled: boolean;
+  watchlistPromotionThreshold: number;
+  adaptiveLearningEnabled: boolean;
+  liquidationAdvisoryEnabled: boolean;
 }
 
 export interface AutomationRunInput {

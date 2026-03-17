@@ -34,6 +34,14 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   favoriteLongshotEnabled: true,
   throughputRecoveryEnabled: true,
   exploratoryFallbackEnabled: true,
+  replacementEnabled: true,
+  replacementMinDelta: 0.02,
+  orderMaintenanceEnabled: true,
+  cancelReplaceMinImprovement: 0.01,
+  watchlistPromotionEnabled: true,
+  watchlistPromotionThreshold: 0.035,
+  adaptiveLearningEnabled: false,
+  liquidationAdvisoryEnabled: true,
 };
 
 function defaultCadence(mode: AutomationMode) {

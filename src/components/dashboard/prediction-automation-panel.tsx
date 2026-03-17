@@ -47,7 +47,15 @@ const categoryOptions: PredictionCategory[] = [
 const sliderControls: Array<{
   key: keyof Pick<
     AutomationControls,
-    "edgeMultiplier" | "confidenceShift" | "spreadMultiplier" | "liquidityMultiplier" | "highProbModelMin" | "highProbMarketMin"
+    | "edgeMultiplier"
+    | "confidenceShift"
+    | "spreadMultiplier"
+    | "liquidityMultiplier"
+    | "highProbModelMin"
+    | "highProbMarketMin"
+    | "replacementMinDelta"
+    | "cancelReplaceMinImprovement"
+    | "watchlistPromotionThreshold"
   >;
   label: string;
   min: number;
@@ -124,12 +132,53 @@ const sliderControls: Array<{
     effectHigh: "Higher = only already-expensive favorites qualify.",
     format: (value) => `${(value * 100).toFixed(0)}%`,
   },
+  {
+    key: "replacementMinDelta",
+    label: "Replacement Margin",
+    min: 0.005,
+    max: 0.08,
+    step: 0.001,
+    description: "Minimum utility delta required before a blocked challenger can replace an incumbent resting order.",
+    effectLow: "Lower = more order replacements, more queue resets.",
+    effectHigh: "Higher = fewer replacements, stronger incumbent protection.",
+    format: (value) => value.toFixed(3),
+  },
+  {
+    key: "cancelReplaceMinImprovement",
+    label: "Cancel/Reprice Min Improvement",
+    min: 0.002,
+    max: 0.05,
+    step: 0.001,
+    description: "Minimum expected-value improvement required before a stale resting order is canceled or repriced.",
+    effectLow: "Lower = more stale-order maintenance actions.",
+    effectHigh: "Higher = fewer quote mutations, more stale orders left alone.",
+    format: (value) => value.toFixed(3),
+  },
+  {
+    key: "watchlistPromotionThreshold",
+    label: "Watchlist Promotion Threshold",
+    min: 0.01,
+    max: 0.12,
+    step: 0.005,
+    description: "Minimum multi-cycle improvement score required before a watchlist name is auto-promoted back into contention.",
+    effectLow: "Lower = more watchlist promotions.",
+    effectHigh: "Higher = watchlist names need clearer improvement before promotion.",
+    format: (value) => value.toFixed(3),
+  },
 ];
 
 const toggleControls: Array<{
   key: keyof Pick<
     AutomationControls,
-    "highProbabilityEnabled" | "favoriteLongshotEnabled" | "throughputRecoveryEnabled" | "exploratoryFallbackEnabled"
+    | "highProbabilityEnabled"
+    | "favoriteLongshotEnabled"
+    | "throughputRecoveryEnabled"
+    | "exploratoryFallbackEnabled"
+    | "replacementEnabled"
+    | "orderMaintenanceEnabled"
+    | "watchlistPromotionEnabled"
+    | "adaptiveLearningEnabled"
+    | "liquidationAdvisoryEnabled"
   >;
   label: string;
   description: string;
@@ -163,6 +212,41 @@ const toggleControls: Array<{
     description: "Allows micro-size fallback candidates when normal flow is too sparse.",
     onText: "On = more fallback activity when signal is thin.",
     offText: "Off = no exploratory filler trades.",
+  },
+  {
+    key: "replacementEnabled",
+    label: "Incumbent Replacement",
+    description: "Allows a blocked challenger to replace a weaker incumbent resting order when the utility delta is large enough.",
+    onText: "On = conflict-blocked orders can be evaluated for replacement.",
+    offText: "Off = conflicts stay blocked without replacement evaluation.",
+  },
+  {
+    key: "orderMaintenanceEnabled",
+    label: "Stale Order Maintenance",
+    description: "Runs keep-vs-cancel-vs-reprice logic over existing resting orders before new execution.",
+    onText: "On = stale orders can be canceled or repriced automatically in live mode.",
+    offText: "Off = resting orders are left untouched.",
+  },
+  {
+    key: "watchlistPromotionEnabled",
+    label: "Watchlist Promotion",
+    description: "Keeps WATCHLIST names alive across cycles and promotes them when they improve enough.",
+    onText: "On = improving watchlist names can re-enter the execution queue.",
+    offText: "Off = watchlist names remain observational only.",
+  },
+  {
+    key: "adaptiveLearningEnabled",
+    label: "Adaptive Learning",
+    description: "Allows bounded false-negative learning recommendations to become active in gate calculations.",
+    onText: "On = small bounded recommendation deltas can influence live gating.",
+    offText: "Off = learning remains recommendation-only.",
+  },
+  {
+    key: "liquidationAdvisoryEnabled",
+    label: "Near-Close Advisory",
+    description: "Evaluates held positions near resolution and emits hold/trim/flatten recommendations.",
+    onText: "On = liquidation recommendations are generated and stored.",
+    offText: "Off = no liquidation advisory pass.",
   },
 ];
 
@@ -512,6 +596,52 @@ export function PredictionAutomationPanel() {
                       {candidate.executionStatus}: {candidate.executionMessage}
                     </p>
 
+                    {candidate.incumbentComparison || candidate.watchlistState || candidate.silentClock || candidate.leadLag || candidate.liquidationRecommendation || candidate.orderMaintenance ? (
+                      <div className="mt-2 space-y-1 text-[11px] text-slate-400">
+                        {candidate.incumbentComparison ? (
+                          <p>
+                            Replacement: {candidate.incumbentComparison.action} | delta {formatNumber(candidate.incumbentComparison.replacementScoreDelta, 4)} |{" "}
+                            incumbent {candidate.incumbentComparison.incumbentSource} {candidate.incumbentComparison.incumbentTicker} {candidate.incumbentComparison.incumbentSide}
+                          </p>
+                        ) : null}
+                        {candidate.watchlistState ? (
+                          <p>
+                            Watchlist: {candidate.watchlistState.status} | age {formatNumber(candidate.watchlistState.ageHours, 1)}h | cycles{" "}
+                            {candidate.watchlistState.cyclesObserved} | promo {formatNumber(candidate.watchlistState.promotionScore, 4)}
+                          </p>
+                        ) : null}
+                        {candidate.silentClock ? (
+                          <p>
+                            Silent clock: penalty {formatPercent(candidate.silentClock.decayPenalty)} | checkpoint{" "}
+                            {formatPercent(candidate.silentClock.checkpointProgress)} | {candidate.silentClock.rationale}
+                          </p>
+                        ) : null}
+                        {candidate.leadLag ? (
+                          <p>
+                            Lead-lag: {candidate.leadLag.leadTicker} -&gt; {candidate.leadLag.lagTicker} | signal{" "}
+                            {formatPercent(candidate.leadLag.signalMagnitude)} | conf {formatPercent(candidate.leadLag.confidence)}
+                          </p>
+                        ) : null}
+                        {candidate.orderMaintenance ? (
+                          <p>
+                            Stale-order maintenance: {candidate.orderMaintenance.action} | improvement{" "}
+                            {formatNumber(candidate.orderMaintenance.expectedImprovement, 4)} | stale{" "}
+                            {formatPercent(candidate.orderMaintenance.staleHazard)}
+                          </p>
+                        ) : null}
+                        {candidate.liquidationRecommendation ? (
+                          <p>
+                            Liquidation: {candidate.liquidationRecommendation.action} | exit edge{" "}
+                            {formatUsd(
+                              candidate.liquidationRecommendation.valueExitNowUsd -
+                                candidate.liquidationRecommendation.valueHoldToResolutionUsd,
+                            )}{" "}
+                            | TTR {formatNumber(candidate.liquidationRecommendation.timeToResolutionDays, 3)}d
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+
                     {candidate.strategicBreakdown ? (
                       <details className="mt-2 rounded border border-slate-800 bg-slate-950/60 p-2">
                         <summary className="cursor-pointer text-[11px] font-semibold text-sky-200">
@@ -686,6 +816,73 @@ export function PredictionAutomationPanel() {
                       </p>
                       <p className="text-slate-400">
                         Drift {formatUsd(attribution.totals.avgCashDeltaDriftUsd)} | Fee {formatUsd(attribution.totals.avgFeeDriftUsd)}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Replacement Engine</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Accepted {attribution.replacement?.accepted ?? 0} | Rejected {attribution.replacement?.rejected ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Avg delta {formatNumber(attribution.replacement?.avgScoreDelta, 4)} | Avg friction{" "}
+                        {formatNumber(attribution.replacement?.avgReplacementCost, 4)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Stale Order Maintenance</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Keep {attribution.orderMaintenance?.keep ?? 0} | Reprice {attribution.orderMaintenance?.reprice ?? 0} | Cancel{" "}
+                        {attribution.orderMaintenance?.cancel ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Avg improvement {formatNumber(attribution.orderMaintenance?.avgExpectedImprovement, 4)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Watchlist Lifecycle</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Active {attribution.watchlist?.active ?? 0} | Promotions {attribution.watchlist?.promotions ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Avg age {formatNumber(attribution.watchlist?.avgWatchlistHours, 1)}h | Promoted hit{" "}
+                        {formatPercent(attribution.watchlist?.promotedHitRate)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">False-Negative Learning</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Active {attribution.learning?.active ? "yes" : "no"} | Recommendations{" "}
+                        {attribution.learning?.recommendations.length ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Lookback {attribution.learning?.lookbackHours ?? 0}h
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Near-Close Liquidation</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Hold {attribution.liquidation?.hold ?? 0} | Trim {attribution.liquidation?.trim ?? 0} | Flatten{" "}
+                        {attribution.liquidation?.flatten ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Avg exit edge {formatUsd(attribution.liquidation?.avgExitEdgeUsd)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Signal Overlays</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Silent clock {attribution.overlays?.silentClockCount ?? 0} | Lead-lag {attribution.overlays?.leadLagCount ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Avg decay {formatPercent(attribution.overlays?.avgSilentClockPenalty)} | Avg lag {formatPercent(attribution.overlays?.avgLeadLagSignal)}
                       </p>
                     </div>
                   </div>
@@ -894,6 +1091,105 @@ export function PredictionAutomationPanel() {
                 </div>
               )}
             </div>
+
+            {attribution ? (
+              <div className="grid gap-3 xl:grid-cols-2">
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                  <p className="mb-2 text-[11px] font-semibold text-sky-200">Recent Replacements</p>
+                  {attribution.replacement?.recent.length ? (
+                    attribution.replacement.recent.map((decision) => (
+                      <p key={`${decision.candidateKey}-${decision.incumbentOrderId ?? decision.incumbentTicker}`} className="mt-1 text-[11px] text-slate-300">
+                        {decision.ticker} {decision.side} | {decision.action} | delta {formatNumber(decision.replacementScoreDelta, 4)} | cost{" "}
+                        {formatNumber(decision.replacementCost + decision.queueResetPenalty, 4)} | incumbent {decision.incumbentSource}{" "}
+                        {decision.incumbentTicker} {decision.incumbentSide}
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No replacement decisions stored yet.</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                  <p className="mb-2 text-[11px] font-semibold text-sky-200">Stale-Order Maintenance</p>
+                  {attribution.orderMaintenance?.recent.length ? (
+                    attribution.orderMaintenance.recent.map((decision) => (
+                      <p key={decision.orderId} className="mt-1 text-[11px] text-slate-300">
+                        {decision.ticker} {decision.side} | {decision.action} | keep {formatNumber(decision.evKeep, 4)} | reprice{" "}
+                        {formatNumber(decision.evReprice, 4)} | cancel {formatNumber(decision.evCancel, 4)} | improve{" "}
+                        {formatNumber(decision.expectedImprovement, 4)}
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No order-maintenance decisions stored yet.</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                  <p className="mb-2 text-[11px] font-semibold text-sky-200">Watchlist Table</p>
+                  {attribution.watchlist?.recent.length ? (
+                    attribution.watchlist.recent.map((event) => (
+                      <p key={`${event.type}-${event.key}-${event.reason}`} className="mt-1 text-[11px] text-slate-300">
+                        {event.ticker} {event.side} | {event.type} | promo {formatNumber(event.promotionScore, 4)} | age{" "}
+                        {formatNumber(event.avgWatchlistHours, 1)}h | edge {formatPercent(event.executionAdjustedEdge ?? event.edge)} |{" "}
+                        {event.reason}
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No watchlist lifecycle has been stored yet.</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                  <p className="mb-2 text-[11px] font-semibold text-sky-200">Learning Recommendations</p>
+                  {attribution.learning?.recommendations.length ? (
+                    attribution.learning.recommendations.map((recommendation) => (
+                      <p key={recommendation.gate} className="mt-1 text-[11px] text-slate-300">
+                        {recommendation.label} | samples {recommendation.sampleCount} | pnl {formatUsd(recommendation.avgCounterfactualPnlUsd)} | delta{" "}
+                        {formatGateMiss(recommendation.boundedDelta, recommendation.unit)} | active {recommendation.active ? "yes" : "no"}
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No bounded false-negative learning recommendations yet.</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                  <p className="mb-2 text-[11px] font-semibold text-sky-200">Liquidation Recommendations</p>
+                  {attribution.liquidation?.recent.length ? (
+                    attribution.liquidation.recent.map((decision) => (
+                      <p key={`${decision.ticker}-${decision.side}-${decision.action}`} className="mt-1 text-[11px] text-slate-300">
+                        {decision.ticker} {decision.side} | {decision.action} | hold {formatUsd(decision.valueHoldToResolutionUsd)} | exit{" "}
+                        {formatUsd(decision.valueExitNowUsd)} | cost {formatUsd(decision.liquidationCostUsd)}
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No liquidation recommendations stored yet.</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                  <p className="mb-2 text-[11px] font-semibold text-sky-200">Recent Signal Overlays</p>
+                  {attribution.overlays && (attribution.overlays.recentSilentClock.length || attribution.overlays.recentLeadLag.length) ? (
+                    <div className="space-y-1">
+                      {attribution.overlays.recentSilentClock.map((overlay, index) => (
+                        <p key={`silent-${index}`} className="text-[11px] text-slate-300">
+                          Silent clock | checkpoint {formatPercent(overlay.checkpointProgress)} | penalty {formatPercent(overlay.decayPenalty)} |{" "}
+                          {overlay.rationale}
+                        </p>
+                      ))}
+                      {attribution.overlays.recentLeadLag.map((overlay, index) => (
+                        <p key={`leadlag-${index}`} className="text-[11px] text-slate-300">
+                          Lead-lag {overlay.leadTicker} -&gt; {overlay.lagTicker} | signal {formatPercent(overlay.signalMagnitude)} | conf{" "}
+                          {formatPercent(overlay.confidence)}
+                        </p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No signal overlays stored yet.</p>
+                  )}
+                </div>
+              </div>
+            ) : null}
 
             {summary.portfolioRanking ? (
               <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
