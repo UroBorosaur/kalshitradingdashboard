@@ -786,6 +786,34 @@ export function PredictionAutomationPanel() {
                         </div>
 
                         <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
+                          <p className="text-[11px] text-slate-400">Gate Waterfall</p>
+                          {attribution.selectionControl.gateWaterfall.length ? (
+                            attribution.selectionControl.gateWaterfall.map((gate) => (
+                              <p key={`waterfall-${gate.gate}`} className="mt-1 text-[11px] text-slate-300">
+                                {gate.label} | primary {gate.primaryCount} avg {formatGateMiss(gate.avgPrimaryMissBy, gate.unit)} | secondary{" "}
+                                {gate.secondaryCount} avg {formatGateMiss(gate.avgSecondaryMissBy, gate.unit)}
+                              </p>
+                            ))
+                          ) : (
+                            <p className="mt-1 text-[11px] text-slate-500">No primary/secondary gate ordering recorded in this lookback window.</p>
+                          )}
+                        </div>
+
+                        <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
+                          <p className="text-[11px] text-slate-400">One-Gate Looser Simulation</p>
+                          {attribution.selectionControl.counterfactualByGate.length ? (
+                            attribution.selectionControl.counterfactualByGate.map((gate) => (
+                              <p key={`counterfactual-${gate.gate}`} className="mt-1 text-[11px] text-slate-300">
+                                {gate.label} | {gate.looseningLabel} | impacted {gate.impactedCount} | extra passes {gate.additionalPasses} | hit{" "}
+                                {formatPercent(gate.conversionRate)}
+                              </p>
+                            ))
+                          ) : (
+                            <p className="mt-1 text-[11px] text-slate-500">No counterfactual threshold simulations available yet.</p>
+                          )}
+                        </div>
+
+                        <div className="rounded border border-slate-800 bg-slate-900/60 p-2">
                           <p className="text-[11px] text-slate-400">Recent Near Misses</p>
                           {attribution.selectionControl.recentNearMisses.length ? (
                             attribution.selectionControl.recentNearMisses.map((miss) => (
@@ -798,7 +826,17 @@ export function PredictionAutomationPanel() {
                                 {formatPercent(miss.executionAdjustedEdge)} | conf {formatPercent(miss.confidence)} | score{" "}
                                 {formatNumber(miss.compositeScore)} | drift {formatPercent(miss.latestQuoteDrift)} | resolved{" "}
                                 {miss.resolved ? (miss.realizedHit ? "HIT" : "MISS") : "pending"} | cf {formatUsd(miss.counterfactualPnlUsd)} | div{" "}
-                                {formatPercent(miss.quoteToExpiryDivergence)} | gates{" "}
+                                {formatPercent(miss.quoteToExpiryDivergence)} | primary{" "}
+                                {miss.primaryFailedGate
+                                  ? `${miss.primaryFailedGate.gate}:${formatGateMiss(miss.primaryFailedGate.missBy, miss.primaryFailedGate.unit)}`
+                                  : "none"}{" "}
+                                | secondary{" "}
+                                {miss.secondaryFailedGates.length
+                                  ? miss.secondaryFailedGates
+                                      .map((gate) => `${gate.gate}:${formatGateMiss(gate.missBy, gate.unit)}`)
+                                      .join("; ")
+                                  : "none"}{" "}
+                                | gates{" "}
                                 {miss.failedGates.length
                                   ? miss.failedGates
                                       .map((gate) => `${gate.gate}:${formatGateMiss(gate.missBy, gate.unit)}${gate.detail ? ` (${gate.detail})` : ""}`)

@@ -199,6 +199,57 @@ function gateLabel(gate: string) {
   }
 }
 
+const GATE_PRIORITY: CandidateGateKey[] = [
+  "POSITION_ORDER_CONFLICT",
+  "ORDER_GROUP_BRAKE",
+  "CLUSTER_CAP",
+  "BOOTSTRAP_HEALTH",
+  "TOXICITY",
+  "UNCERTAINTY_WIDTH",
+  "EXECUTION_EDGE",
+  "CONFIDENCE_FLOOR",
+];
+
+function gatePriority(gate: CandidateGateKey) {
+  const index = GATE_PRIORITY.indexOf(gate);
+  return index === -1 ? GATE_PRIORITY.length : index;
+}
+
+function sortFailedGates(diagnostics: StoredCandidateDecisionEvent["gateDiagnostics"]) {
+  return [...(diagnostics ?? [])]
+    .filter((diagnostic) => !diagnostic.passed && diagnostic.missBy > 0)
+    .sort((a, b) => {
+      const priorityDiff = gatePriority(a.gate) - gatePriority(b.gate);
+      if (priorityDiff !== 0) return priorityDiff;
+      return b.missBy - a.missBy;
+    });
+}
+
+function gateLooseningAmount(
+  diagnostic: NonNullable<StoredCandidateDecisionEvent["gateDiagnostics"]>[number],
+) {
+  if (diagnostic.unit === "count" || diagnostic.unit === "severity") return 1;
+
+  const thresholdMagnitude =
+    typeof diagnostic.threshold === "number" && Number.isFinite(diagnostic.threshold) && diagnostic.threshold !== 0
+      ? Math.abs(diagnostic.threshold)
+      : diagnostic.unit === "probability"
+        ? 0.1
+        : Math.max(1, Math.abs(diagnostic.observed ?? 0));
+
+  return thresholdMagnitude * 0.1;
+}
+
+function gateLooseningLabel(
+  diagnostic: NonNullable<StoredCandidateDecisionEvent["gateDiagnostics"]>[number],
+) {
+  const amount = gateLooseningAmount(diagnostic);
+  if (diagnostic.unit === "probability") return `${(amount * 100).toFixed(1)} pts looser`;
+  if (diagnostic.unit === "usd") return `$${amount.toFixed(2)} looser`;
+  if (diagnostic.unit === "count") return `${amount.toFixed(0)} count looser`;
+  return `${amount.toFixed(0)} severity step looser`;
+}
+
 function settlementMarkForDecision(
   resolution: StoredResolutionEvent | undefined,
   side: PredictionSide,
@@ -811,6 +862,31 @@ export function summarizeExecutionAttribution({
     string,
     { gate: string; label: string; unit: "probability" | "usd" | "count" | "severity"; count: number; missSum: number; missCount: number; maxMissBy: number }
   >();
+  const gateWaterfallMap = new Map<
+    string,
+    {
+      gate: CandidateGateKey;
+      label: string;
+      unit: "probability" | "usd" | "count" | "severity";
+      primaryCount: number;
+      secondaryCount: number;
+      primaryMissSum: number;
+      primaryMissCount: number;
+      secondaryMissSum: number;
+      secondaryMissCount: number;
+    }
+  >();
+  const gateCounterfactualMap = new Map<
+    string,
+    {
+      gate: CandidateGateKey;
+      label: string;
+      unit: "probability" | "usd" | "count" | "severity";
+      looseningLabel: string;
+      impactedCount: number;
+      additionalPasses: number;
+    }
+  >();
   const nearMissAvgEdge = average(
     nearMisses.reduce((sum, event) => sum + event.payload.edge, 0),
     nearMisses.length,
@@ -852,7 +928,9 @@ export function summarizeExecutionAttribution({
     .map((event) => {
       const dominantExpert = determineDominantExpert(event.payload.expertWeights);
       const latestQuoteDrift = latestQuoteDriftForDecision({ decision: event, quotesByTicker });
-      const failedGates = (event.payload.gateDiagnostics ?? []).filter((diagnostic) => !diagnostic.passed && diagnostic.missBy > 0);
+      const failedGates = sortFailedGates(event.payload.gateDiagnostics);
+      const primaryFailedGate = failedGates[0] ?? null;
+      const secondaryFailedGates = failedGates.slice(1);
       for (const diagnostic of failedGates) {
         const accumulator = gateSummaryMap.get(diagnostic.gate) ?? {
           gate: diagnostic.gate,
@@ -870,6 +948,47 @@ export function summarizeExecutionAttribution({
           accumulator.maxMissBy = Math.max(accumulator.maxMissBy, diagnostic.missBy);
         }
         gateSummaryMap.set(diagnostic.gate, accumulator);
+      }
+      failedGates.forEach((diagnostic, index) => {
+        const accumulator = gateWaterfallMap.get(diagnostic.gate) ?? {
+          gate: diagnostic.gate,
+          label: gateLabel(diagnostic.gate),
+          unit: diagnostic.unit,
+          primaryCount: 0,
+          secondaryCount: 0,
+          primaryMissSum: 0,
+          primaryMissCount: 0,
+          secondaryMissSum: 0,
+          secondaryMissCount: 0,
+        };
+
+        if (index === 0) {
+          accumulator.primaryCount += 1;
+          accumulator.primaryMissSum += diagnostic.missBy;
+          accumulator.primaryMissCount += 1;
+        } else {
+          accumulator.secondaryCount += 1;
+          accumulator.secondaryMissSum += diagnostic.missBy;
+          accumulator.secondaryMissCount += 1;
+        }
+        gateWaterfallMap.set(diagnostic.gate, accumulator);
+      });
+      for (const diagnostic of failedGates) {
+        const accumulator = gateCounterfactualMap.get(diagnostic.gate) ?? {
+          gate: diagnostic.gate,
+          label: gateLabel(diagnostic.gate),
+          unit: diagnostic.unit,
+          looseningLabel: gateLooseningLabel(diagnostic),
+          impactedCount: 0,
+          additionalPasses: 0,
+        };
+        accumulator.impactedCount += 1;
+        const looseningAmount = gateLooseningAmount(diagnostic);
+        const wouldPassIfLooser =
+          diagnostic.missBy <= looseningAmount &&
+          failedGates.every((other) => other.gate === diagnostic.gate || other.missBy <= 0);
+        if (wouldPassIfLooser) accumulator.additionalPasses += 1;
+        gateCounterfactualMap.set(diagnostic.gate, accumulator);
       }
       const resolution = resolutionByTicker.get(event.payload.ticker)?.payload;
       const settlementMark = settlementMarkForDecision(resolution, event.payload.side);
@@ -941,6 +1060,8 @@ export function summarizeExecutionAttribution({
         expiryDrift,
         quoteToExpiryDivergence,
         failedGates,
+        primaryFailedGate,
+        secondaryFailedGates,
         executionMessage: event.payload.executionMessage,
       };
     });
@@ -956,6 +1077,35 @@ export function summarizeExecutionAttribution({
     .sort((a, b) => {
       if (b.count !== a.count) return b.count - a.count;
       return (b.avgMissBy ?? 0) - (a.avgMissBy ?? 0);
+    });
+  const gateWaterfall = [...gateWaterfallMap.values()]
+    .map((row) => ({
+      gate: row.gate,
+      label: row.label,
+      unit: row.unit,
+      primaryCount: row.primaryCount,
+      secondaryCount: row.secondaryCount,
+      avgPrimaryMissBy: average(row.primaryMissSum, row.primaryMissCount),
+      avgSecondaryMissBy: average(row.secondaryMissSum, row.secondaryMissCount),
+    }))
+    .sort((a, b) => {
+      if (b.primaryCount !== a.primaryCount) return b.primaryCount - a.primaryCount;
+      if (b.secondaryCount !== a.secondaryCount) return b.secondaryCount - a.secondaryCount;
+      return (a.avgPrimaryMissBy ?? Infinity) - (b.avgPrimaryMissBy ?? Infinity);
+    });
+  const counterfactualByGate = [...gateCounterfactualMap.values()]
+    .map((row) => ({
+      gate: row.gate,
+      label: row.label,
+      unit: row.unit,
+      looseningLabel: row.looseningLabel,
+      impactedCount: row.impactedCount,
+      additionalPasses: row.additionalPasses,
+      conversionRate: average(row.additionalPasses, row.impactedCount),
+    }))
+    .sort((a, b) => {
+      if (b.additionalPasses !== a.additionalPasses) return b.additionalPasses - a.additionalPasses;
+      return (b.conversionRate ?? 0) - (a.conversionRate ?? 0);
     });
 
   return {
@@ -1012,6 +1162,8 @@ export function summarizeExecutionAttribution({
       falseNegativesByCluster: finalizeCounterfactualBuckets(falseNegativesByCluster, bucketLimit),
       falseNegativesByToxicity: finalizeCounterfactualBuckets(falseNegativesByToxicity, bucketLimit),
       byGate,
+      gateWaterfall,
+      counterfactualByGate,
       recentNearMisses,
     },
   };

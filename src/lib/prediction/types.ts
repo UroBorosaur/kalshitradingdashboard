@@ -308,6 +308,26 @@ export interface SelectionGateSummary {
   maxMissBy: number | null;
 }
 
+export interface SelectionGateWaterfallSummary {
+  gate: CandidateGateKey;
+  label: string;
+  unit: "probability" | "usd" | "count" | "severity";
+  primaryCount: number;
+  secondaryCount: number;
+  avgPrimaryMissBy: number | null;
+  avgSecondaryMissBy: number | null;
+}
+
+export interface SelectionGateCounterfactualSummary {
+  gate: CandidateGateKey;
+  label: string;
+  unit: "probability" | "usd" | "count" | "severity";
+  looseningLabel: string;
+  impactedCount: number;
+  additionalPasses: number;
+  conversionRate: number | null;
+}
+
 export interface ExecutionAttributionTrade {
   recordedAt: string;
   ticker: string;
@@ -411,6 +431,8 @@ export interface ExecutionAttributionSummary {
     falseNegativesByCluster: ExecutionCounterfactualBucket[];
     falseNegativesByToxicity: ExecutionCounterfactualBucket[];
     byGate: SelectionGateSummary[];
+    gateWaterfall: SelectionGateWaterfallSummary[];
+    counterfactualByGate: SelectionGateCounterfactualSummary[];
     recentNearMisses: Array<{
       recordedAt: string;
       ticker: string;
@@ -433,6 +455,8 @@ export interface ExecutionAttributionSummary {
       expiryDrift: number | null;
       quoteToExpiryDivergence: number | null;
       failedGates: CandidateGateDiagnostic[];
+      primaryFailedGate: CandidateGateDiagnostic | null;
+      secondaryFailedGates: CandidateGateDiagnostic[];
       executionMessage?: string;
     }>;
   };

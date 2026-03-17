@@ -176,6 +176,99 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
       },
       "2026-03-16T11:45:00.000Z",
     ),
+    envelope<StoredCandidateDecisionEvent>(
+      "candidate_decisions",
+      "automation/planned-candidates",
+      "decision:run-4:MISS2:NO",
+      {
+        runId: "run-4",
+        mode: "AI",
+        executeRequested: true,
+        ticker: "MISS2",
+        title: "Two Gate Miss",
+        category: "POLITICS",
+        side: "NO",
+        verdict: "WATCHLIST",
+        marketProb: 0.57,
+        modelProb: 0.62,
+        edge: 0.018,
+        executionAdjustedEdge: 0.014,
+        confidence: 0.44,
+        recommendedStakeUsd: 2.1,
+        recommendedContracts: 3,
+        limitPriceCents: 57,
+        probabilityTransform: "SIGMOID",
+        calibrationMethod: "TEMPERATURE",
+        compositeScore: 0.006,
+        riskCluster: "POLITICS:MISS2",
+        gateDiagnostics: [
+          {
+            gate: "EXECUTION_EDGE",
+            passed: false,
+            observed: -0.006,
+            threshold: 0,
+            missBy: 0.006,
+            unit: "probability",
+            detail: "Execution-adjusted edge fell slightly negative after penalties.",
+          },
+          {
+            gate: "CONFIDENCE_FLOOR",
+            passed: false,
+            observed: 0.441,
+            threshold: 0.448,
+            missBy: 0.007,
+            unit: "probability",
+            detail: "Primary confidence floor",
+          },
+        ],
+        executionStatus: "SKIPPED",
+        executionMessage: "Skipped on multiple near-threshold gates.",
+        rationale: [],
+      },
+      "2026-03-16T11:46:00.000Z",
+    ),
+    envelope<StoredCandidateDecisionEvent>(
+      "candidate_decisions",
+      "automation/planned-candidates",
+      "decision:run-5:MISS3:YES",
+      {
+        runId: "run-5",
+        mode: "AI",
+        executeRequested: true,
+        ticker: "MISS3",
+        title: "Single Confidence Miss",
+        category: "SPORTS",
+        side: "YES",
+        verdict: "WATCHLIST",
+        marketProb: 0.52,
+        modelProb: 0.56,
+        edge: 0.019,
+        executionAdjustedEdge: 0.016,
+        confidence: 0.443,
+        recommendedStakeUsd: 2.4,
+        recommendedContracts: 4,
+        limitPriceCents: 52,
+        probabilityTransform: "SIGMOID",
+        calibrationMethod: "TEMPERATURE",
+        compositeScore: 0.0065,
+        riskCluster: "SPORTS:MISS3",
+        gateDiagnostics: [
+          {
+            gate: "CONFIDENCE_FLOOR",
+            passed: false,
+            observed: 0.443,
+            threshold: 0.45,
+            missBy: 0.007,
+            unit: "probability",
+            detail: "Primary confidence floor",
+          },
+        ],
+        executionStatus: "SKIPPED",
+        executionMessage: "Skipped on narrow confidence miss.",
+        rationale: [],
+      },
+      "2026-03-16T11:47:00.000Z",
+    ),
   ];
 
   const orders = [
@@ -372,18 +465,26 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(firstTrade.inferredActualFeeUsd, 0.02);
 
   assert.equal(summary.selectionControl?.executed.count, 1);
-  assert.equal(summary.selectionControl?.nearMisses.count, 2);
-  assert.equal(summary.selectionControl?.recentNearMisses[0]?.ticker, "MISS");
-  assert.equal(summary.selectionControl?.recentNearMisses[0]?.latestQuoteDrift, 0.05);
-  assert.equal(summary.selectionControl?.recentNearMisses[0]?.resolved, true);
-  assert.equal(summary.selectionControl?.recentNearMisses[0]?.realizedHit, true);
-  assert.equal(summary.selectionControl?.recentNearMisses[0]?.counterfactualPnlUsd, 2.9);
-  assert.equal(summary.selectionControl?.recentNearMisses[0]?.failedGates[0]?.gate, "POSITION_ORDER_CONFLICT");
+  assert.equal(summary.selectionControl?.nearMisses.count, 4);
+  const missRow = summary.selectionControl?.recentNearMisses.find((row) => row.ticker === "MISS");
+  assert.equal(missRow?.latestQuoteDrift, 0.05);
+  assert.equal(missRow?.resolved, true);
+  assert.equal(missRow?.realizedHit, true);
+  assert.equal(missRow?.counterfactualPnlUsd, 2.9);
+  assert.equal(missRow?.failedGates[0]?.gate, "POSITION_ORDER_CONFLICT");
+  assert.equal(missRow?.primaryFailedGate?.gate, "POSITION_ORDER_CONFLICT");
+  const miss2Row = summary.selectionControl?.recentNearMisses.find((row) => row.ticker === "MISS2");
+  assert.equal(miss2Row?.primaryFailedGate?.gate, "EXECUTION_EDGE");
+  assert.equal(miss2Row?.secondaryFailedGates[0]?.gate, "CONFIDENCE_FLOOR");
   assert.equal(summary.selectionControl?.resolvedNearMisses.count, 1);
   assert.equal(summary.selectionControl?.resolvedNearMisses.hitRate, 1);
   assert.equal(summary.selectionControl?.resolvedNearMisses.profitableRate, 1);
   assert.equal(summary.selectionControl?.resolvedNearMisses.totalCounterfactualPnlUsd, 2.9);
   assert.equal(summary.selectionControl?.falseNegativesByExpert[0]?.key, "MICROSTRUCTURE");
-  assert.equal(summary.selectionControl?.byGate[0]?.gate, "POSITION_ORDER_CONFLICT");
-  assert.equal(summary.selectionControl?.byGate[0]?.avgMissBy, 1);
+  assert.equal(summary.selectionControl?.byGate.find((row) => row.gate === "POSITION_ORDER_CONFLICT")?.avgMissBy, 1);
+  assert.equal(summary.selectionControl?.byGate.find((row) => row.gate === "CONFIDENCE_FLOOR")?.count, 2);
+  assert.equal(summary.selectionControl?.gateWaterfall.find((row) => row.gate === "EXECUTION_EDGE")?.primaryCount, 1);
+  assert.equal(summary.selectionControl?.gateWaterfall.find((row) => row.gate === "CONFIDENCE_FLOOR")?.secondaryCount, 1);
+  assert.equal(summary.selectionControl?.counterfactualByGate.find((row) => row.gate === "CONFIDENCE_FLOOR")?.additionalPasses, 1);
+  assert.equal(summary.selectionControl?.counterfactualByGate.find((row) => row.gate === "EXECUTION_EDGE")?.additionalPasses, 0);
 });
