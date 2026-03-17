@@ -17,7 +17,7 @@ const plexMono = IBM_Plex_Mono({
 
 export const metadata: Metadata = {
   title: "Apex Trader Performance Hub",
-  description: "Production-grade dark-mode trading analytics dashboard with game-theory decision support.",
+  description: "Prediction-market execution, attribution, and regime analysis stack for Kalshi-style contracts.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

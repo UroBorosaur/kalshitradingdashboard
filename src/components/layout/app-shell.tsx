@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, BriefcaseBusiness, BrainCircuit, CandlestickChart, GitBranch, ListChecks } from "lucide-react";
+import { BarChart3, BriefcaseBusiness, BrainCircuit, CandlestickChart, GitBranch, House, ListChecks } from "lucide-react";
 
 import { TechOrb } from "@/components/layout/tech-orb";
 import { useLiveBrokerData } from "@/hooks/use-live-broker-data";
@@ -10,7 +10,8 @@ import { cn, formatCurrency } from "@/lib/utils";
 import { useDashboardStore } from "@/store/dashboard-store";
 
 const nav = [
-  { href: "/", label: "Dashboard", icon: BarChart3 },
+  { href: "/", label: "Home", icon: House },
+  { href: "/dashboard", label: "Dashboard", icon: BarChart3 },
   { href: "/positions", label: "Position Summary", icon: BriefcaseBusiness },
   { href: "/trades", label: "Trades", icon: ListChecks },
   { href: "/setups", label: "Setups", icon: CandlestickChart },
