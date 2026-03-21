@@ -41,6 +41,13 @@ function toFiniteNumber(value: unknown): number | null {
   return null;
 }
 
+function cleanKalshiTitle(value: string | null | undefined, ticker: string): string | null {
+  const title = value?.trim();
+  if (!title) return null;
+  if (title.toUpperCase() === ticker.toUpperCase()) return null;
+  return title;
+}
+
 function hashString(text: string): number {
   let h = 2166136261;
   for (let i = 0; i < text.length; i += 1) {
@@ -376,6 +383,7 @@ export function mapKalshiOrdersToTrades(
   fills: KalshiFillLite[],
   quotesByTicker: Record<string, KalshiQuoteLite>,
   equityBase: number,
+  titlesByTicker: Record<string, string> = {},
 ): Trade[] {
   if (!orders.length) return [];
 
@@ -390,7 +398,12 @@ export function mapKalshiOrdersToTrades(
   return orders
     .map((order) => {
       const ticker = order.ticker.toUpperCase();
-      const contractTitle = order.title?.trim() ? order.title.trim() : ticker;
+      const quote = quotesByTicker[ticker];
+      const contractTitle =
+        cleanKalshiTitle(quote?.title, ticker) ??
+        cleanKalshiTitle(order.title, ticker) ??
+        cleanKalshiTitle(titlesByTicker[ticker], ticker) ??
+        ticker;
       const category = inferKalshiCategoryFromTicker(ticker);
       const setup = kalshiSetupForCategory(category);
       const regime = kalshiRegimeForCategory(category);
@@ -425,8 +438,6 @@ export function mapKalshiOrdersToTrades(
         : order.count;
       const contracts = Number(Math.max(0, inferredContracts).toFixed(6));
       if (contracts <= 0 && mappedStatus !== "OPEN") return null;
-      const quote = quotesByTicker[ticker];
-
       const entryPriceCentsFromOrder =
         order.side === "yes"
           ? (order.yes_price ??
@@ -541,8 +552,10 @@ export function mapKalshiPositionsToTrades(
     const regime = kalshiRegimeForCategory(category);
 
     const quote = quotesByTicker[ticker];
-    const fallbackTitle = titlesByTicker[ticker]?.trim();
-    const contractTitle = quote?.title?.trim() || fallbackTitle || ticker;
+    const contractTitle =
+      cleanKalshiTitle(quote?.title, ticker) ??
+      cleanKalshiTitle(titlesByTicker[ticker], ticker) ??
+      ticker;
 
     const exposure = toFiniteNumber(position.market_exposure_dollars);
     const totalTraded = toFiniteNumber(position.total_traded_dollars);

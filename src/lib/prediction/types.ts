@@ -20,6 +20,7 @@ export type CandidateGateKey =
   | "POSITION_ORDER_CONFLICT"
   | "BOOTSTRAP_HEALTH";
 export type StrategyTag =
+  | "BTC_MICRO_LONGSHOT"
   | "FAVORITE_LONGSHOT_BIAS"
   | "SETTLEMENT_SPEC_ARBITRAGE"
   | "STRIKE_LADDER_COHERENCE"
@@ -221,6 +222,58 @@ export interface LeadLagSignal {
   rationale: string;
 }
 
+export interface BitcoinMicroLongshotSetup {
+  eligible: boolean;
+  focusWindow: boolean;
+  probabilityGap: number;
+  modelProbabilityFloor: number;
+  marketProbabilityCeiling: number;
+  minGap: number;
+  minEdge: number;
+  minConfidence: number;
+  maxSpread: number;
+  minLiquidityScore: number;
+  maxToxicity: number;
+  executionAdjustedEdgeFloor: number;
+  sizeScale: number;
+  stakeCapUsd?: number | null;
+  rationale: string;
+}
+
+export interface StrategyLanePerformanceSummary {
+  decisions: number;
+  placed: number;
+  fillRate: number | null;
+  avgMarketProb: number | null;
+  avgProbabilityGap: number | null;
+  avgEdge: number | null;
+  avgExecutionAdjustedEdge: number | null;
+  avgMarkout30s: number | null;
+  avgMarkoutExpiry: number | null;
+  avgNetAlphaUsd: number | null;
+}
+
+export interface StrategyPerformanceSlice {
+  key: string;
+  trades: number;
+  prevalence: number;
+  avgExecutionAdjustedEdge: number | null;
+  avgMarkout30s: number | null;
+  avgMarkoutExpiry: number | null;
+  avgNetAlphaUsd: number | null;
+  profitabilityScore: number;
+  recommendedBoost: number;
+  examples: string[];
+}
+
+export interface StrategyPerformanceProfile {
+  generatedAt: string;
+  lookbackHours: number;
+  totalPlacedTrades: number;
+  topTags: StrategyPerformanceSlice[];
+  topCategories: StrategyPerformanceSlice[];
+}
+
 export interface OverlayPerformanceSlice {
   decisions: number;
   placed: number;
@@ -329,6 +382,7 @@ export interface PredictionCandidate {
   leadLag?: LeadLagSignal;
   liquidationRecommendation?: LiquidationDecision;
   orderMaintenance?: OrderMaintenanceDecision;
+  btcMicroLongshot?: BitcoinMicroLongshotSetup;
   executionPlan?: {
     limitPriceCents: number;
     patienceHours: number;
@@ -362,6 +416,8 @@ export interface PredictionCandidate {
   bootstrapMode?: ExecutionBootstrapMode;
   executionHealthRegime?: ExecutionHealthRegime;
   executionHealthPenalty?: number;
+  strategyPerformanceBoost?: number;
+  strategyPerformanceReasons?: string[];
 }
 
 export interface StrategicBreakdown {
@@ -633,6 +689,8 @@ export interface ExecutionAttributionTrade {
   leadLagProbabilityContribution?: number | null;
   leadLagScoreContribution?: number | null;
   clusterStress?: boolean;
+  strategyTags?: StrategyTag[];
+  btcMicroLongshotProbabilityGap?: number | null;
   limitPriceCents: number;
   executionRole?: ExecutionPlanRole;
   fillProbability?: number | null;
@@ -685,6 +743,10 @@ export interface ExecutionAttributionSummary {
   learning?: FalseNegativeLearningOutput;
   liquidation?: LiquidationAttributionSummary;
   overlays?: SignalOverlayAttributionSummary;
+  strategyLanes?: {
+    bitcoinMicroLongshot: StrategyLanePerformanceSummary;
+  };
+  strategyPerformance?: StrategyPerformanceProfile;
   selectionControl?: {
     executed: {
       count: number;
@@ -754,6 +816,9 @@ export interface AutomationControls {
   highProbMarketMin: number;
   highProbabilityEnabled: boolean;
   favoriteLongshotEnabled: boolean;
+  bitcoinMicroLongshotEnabled: boolean;
+  bitcoinMicroLongshotMarketMax: number;
+  bitcoinMicroLongshotMinGap: number;
   throughputRecoveryEnabled: boolean;
   exploratoryFallbackEnabled: boolean;
   replacementEnabled: boolean;
@@ -764,6 +829,8 @@ export interface AutomationControls {
   watchlistPromotionThreshold: number;
   adaptiveLearningEnabled: boolean;
   liquidationAdvisoryEnabled: boolean;
+  strategyPerformanceEnabled: boolean;
+  strategyPerformanceMaxBoost: number;
 }
 
 export interface AutomationRunInput {
@@ -779,6 +846,9 @@ export interface KalshiOrderRequest {
   count: number;
   limitPriceCents: number;
   contractStep?: number;
+  action?: "buy" | "sell";
+  reduceOnly?: boolean;
+  timeInForce?: "fill_or_kill" | "good_till_canceled" | "immediate_or_cancel";
   orderGroupId?: string;
   clientOrderId?: string;
 }

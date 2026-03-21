@@ -7,6 +7,7 @@ import {
   cancelKalshiDemoOrder,
   getKalshiDemoBalanceUsd,
   getKalshiDemoBalancesUsd,
+  getKalshiMarketQuotes,
   kalshiConnectionStatus,
   placeKalshiDemoOrder,
 } from "@/lib/prediction/kalshi";
@@ -41,6 +42,8 @@ import {
 } from "@/lib/storage/prediction-store";
 import { buildFalseNegativeLearning } from "@/lib/prediction/false-negative-learning";
 import { loadExecutionAttributionSummary } from "@/lib/prediction/execution-attribution";
+import { evaluateBitcoinMicroLongshot } from "@/lib/prediction/btc-longshot";
+import { evaluateBitcoinRiskExit } from "@/lib/prediction/btc-risk-exits";
 import { evaluateLiquidationDecision } from "@/lib/prediction/liquidation";
 import { evaluateOrderMaintenance } from "@/lib/prediction/order-maintenance";
 import {
@@ -49,6 +52,7 @@ import {
   type OpenExposureConstraint as OpenPositionConstraint,
 } from "@/lib/prediction/replacement";
 import { estimateLeadLagSignal, estimateSilentClockContribution } from "@/lib/prediction/signal-overlays";
+import { buildStrategyPerformanceProfile, evaluateStrategyPerformanceAdjustment } from "@/lib/prediction/strategy-performance";
 import { updateWatchlistLifecycle } from "@/lib/prediction/watchlist";
 import {
   entmaxBisect,
@@ -84,6 +88,7 @@ import type {
   ShadowBaselineProfile,
   SilentClockContribution,
   StrategicBreakdown,
+  StrategyPerformanceProfile,
   StrategyTag,
   WatchlistPromotionDecision,
   WatchlistState,
@@ -309,6 +314,19 @@ const BITCOIN_MICRO_HIGH_PROB_MODEL_MIN = 0.6;
 const BITCOIN_MICRO_HIGH_PROB_MARKET_MIN = 0.6;
 const BITCOIN_MICRO_HIGH_PROB_EDGE_MIN = 0.006;
 const BITCOIN_MICRO_HIGH_PROB_CONFIDENCE_MIN = 0.44;
+const BITCOIN_MICRO_LONGSHOT_DEFAULT_MARKET_MAX = 0.38;
+const BITCOIN_MICRO_LONGSHOT_DEFAULT_MIN_GAP = 0.035;
+const BITCOIN_MICRO_LONGSHOT_MODEL_FLOOR = 0.18;
+const BITCOIN_MICRO_LONGSHOT_EDGE_MIN = 0.005;
+const BITCOIN_MICRO_LONGSHOT_CONFIDENCE_MIN = 0.36;
+const BITCOIN_MICRO_LONGSHOT_MAX_SPREAD = 0.09;
+const BITCOIN_MICRO_LONGSHOT_MIN_LIQUIDITY = 0.18;
+const BITCOIN_MICRO_LONGSHOT_MAX_TOXICITY = 0.48;
+const BITCOIN_MICRO_LONGSHOT_EXEC_EDGE_MIN = 0.0025;
+const BITCOIN_MICRO_LONGSHOT_FOCUS_SIZE_SCALE = 0.38;
+const BITCOIN_MICRO_LONGSHOT_OUTER_SIZE_SCALE = 0.28;
+const BITCOIN_STOP_LOSS_PCT = 0.1;
+const BITCOIN_TAKE_PROFIT_PCT = 0.25;
 const UNCERTAINTY_QUOTE_WIDENING_ALPHA = 0.65;
 const TOXICITY_WIDEN_THRESHOLD = 0.55;
 const TOXICITY_PASSIVE_SHUTOFF = 0.82;
@@ -348,6 +366,9 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   highProbMarketMin: 0.82,
   highProbabilityEnabled: true,
   favoriteLongshotEnabled: true,
+  bitcoinMicroLongshotEnabled: true,
+  bitcoinMicroLongshotMarketMax: BITCOIN_MICRO_LONGSHOT_DEFAULT_MARKET_MAX,
+  bitcoinMicroLongshotMinGap: BITCOIN_MICRO_LONGSHOT_DEFAULT_MIN_GAP,
   throughputRecoveryEnabled: true,
   exploratoryFallbackEnabled: true,
   replacementEnabled: true,
@@ -358,6 +379,8 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   watchlistPromotionThreshold: 0.035,
   adaptiveLearningEnabled: false,
   liquidationAdvisoryEnabled: true,
+  strategyPerformanceEnabled: true,
+  strategyPerformanceMaxBoost: 0.0025,
 };
 
 interface HighProbThresholds {
@@ -509,6 +532,18 @@ function normalizeAutomationControls(input?: Partial<AutomationControls>): Autom
     highProbMarketMin: clamp(input?.highProbMarketMin ?? DEFAULT_AUTOMATION_CONTROLS.highProbMarketMin, 0.5, 0.97),
     highProbabilityEnabled: input?.highProbabilityEnabled ?? DEFAULT_AUTOMATION_CONTROLS.highProbabilityEnabled,
     favoriteLongshotEnabled: input?.favoriteLongshotEnabled ?? DEFAULT_AUTOMATION_CONTROLS.favoriteLongshotEnabled,
+    bitcoinMicroLongshotEnabled:
+      input?.bitcoinMicroLongshotEnabled ?? DEFAULT_AUTOMATION_CONTROLS.bitcoinMicroLongshotEnabled,
+    bitcoinMicroLongshotMarketMax: clamp(
+      input?.bitcoinMicroLongshotMarketMax ?? DEFAULT_AUTOMATION_CONTROLS.bitcoinMicroLongshotMarketMax,
+      0.12,
+      0.6,
+    ),
+    bitcoinMicroLongshotMinGap: clamp(
+      input?.bitcoinMicroLongshotMinGap ?? DEFAULT_AUTOMATION_CONTROLS.bitcoinMicroLongshotMinGap,
+      0.005,
+      0.12,
+    ),
     throughputRecoveryEnabled: input?.throughputRecoveryEnabled ?? DEFAULT_AUTOMATION_CONTROLS.throughputRecoveryEnabled,
     exploratoryFallbackEnabled: input?.exploratoryFallbackEnabled ?? DEFAULT_AUTOMATION_CONTROLS.exploratoryFallbackEnabled,
     replacementEnabled: input?.replacementEnabled ?? DEFAULT_AUTOMATION_CONTROLS.replacementEnabled,
@@ -527,6 +562,12 @@ function normalizeAutomationControls(input?: Partial<AutomationControls>): Autom
     ),
     adaptiveLearningEnabled: input?.adaptiveLearningEnabled ?? DEFAULT_AUTOMATION_CONTROLS.adaptiveLearningEnabled,
     liquidationAdvisoryEnabled: input?.liquidationAdvisoryEnabled ?? DEFAULT_AUTOMATION_CONTROLS.liquidationAdvisoryEnabled,
+    strategyPerformanceEnabled: input?.strategyPerformanceEnabled ?? DEFAULT_AUTOMATION_CONTROLS.strategyPerformanceEnabled,
+    strategyPerformanceMaxBoost: clamp(
+      input?.strategyPerformanceMaxBoost ?? DEFAULT_AUTOMATION_CONTROLS.strategyPerformanceMaxBoost,
+      0,
+      0.006,
+    ),
   };
 }
 
@@ -600,6 +641,17 @@ function firstDefined(...values: Array<number | null | undefined>) {
     if (typeof value === "number" && Number.isFinite(value)) return value;
   }
   return null;
+}
+
+function isKalshiMarketNotFoundError(error: unknown) {
+  const message = String((error as Error | undefined)?.message ?? "").toLowerCase();
+  return message.includes("market_not_found") || message.includes("market not found");
+}
+
+function isTradableKalshiStatus(status: string | null | undefined) {
+  const normalized = String(status ?? "").trim().toLowerCase();
+  if (!normalized) return true;
+  return ["open", "active", "trading", "initialized"].includes(normalized);
 }
 
 function isBuyVerdict(verdict: CandidateVerdict | undefined): boolean {
@@ -811,7 +863,13 @@ function candidateUtilityScore(candidate: PredictionCandidate, rules: ModeRules)
   const uncertaintyPenalty = 1 + Math.max(0, candidate.uncertaintyWidth ?? 0) * 2.4;
   const toxicityPenalty = 1 + Math.max(0, candidate.toxicityScore ?? 0) * 1.7;
   const executionLift = 1 + Math.max(-0.2, Math.min(0.35, candidate.executionAdjustedEdge ?? 0));
-  return (boundedKelly * executionLift) / (timePenalty * uncertaintyPenalty * toxicityPenalty);
+  const btcMicroLongshotBonus = candidate.btcMicroLongshot?.eligible
+    ? 1 +
+      clamp((candidate.btcMicroLongshot.probabilityGap - candidate.btcMicroLongshot.minGap) * 6, 0, 0.1) +
+      (candidate.btcMicroLongshot.focusWindow ? 0.04 : 0.015)
+    : 1;
+  const strategyPerformanceLift = 1 + clamp((candidate.strategyPerformanceBoost ?? 0) * 25, -0.18, 0.18);
+  return (boundedKelly * executionLift * btcMicroLongshotBonus * strategyPerformanceLift) / (timePenalty * uncertaintyPenalty * toxicityPenalty);
 }
 
 function inferStructuralStrategyTags(market: PredictionMarketQuote): StrategyTag[] {
@@ -932,6 +990,10 @@ function meetsGlobalHighProbabilityDefinition(args: {
       args.edge >= thresholds.edgeMin &&
       args.confidence >= thresholds.confidenceMin,
   };
+}
+
+function isBitcoinMicroLongshotCandidate(candidate: PredictionCandidate) {
+  return Boolean(candidate.btcMicroLongshot?.eligible) || candidate.strategyTags?.includes("BTC_MICRO_LONGSHOT");
 }
 
 function filterExistingPositionCandidates(
@@ -2087,7 +2149,10 @@ function bitcoinMainstayScore(candidate: PredictionCandidate): number {
     ? clamp((BITCOIN_MICRO_HORIZON_DAYS - horizon) / BITCOIN_MICRO_HORIZON_DAYS, 0, 1) * 0.08
     : 0;
   const focusBonus = clamp((BITCOIN_FOCUS_HORIZON_DAYS / horizon) - 0.4, 0, 1.2) * 0.06;
-  return candidateUtilityScore(candidate, MODE_RULES.CONSERVATIVE) + microBonus + focusBonus;
+  const longshotBonus = candidate.btcMicroLongshot?.eligible
+    ? clamp(candidate.btcMicroLongshot.probabilityGap * 1.6, 0.02, 0.12) + (candidate.btcMicroLongshot.focusWindow ? 0.06 : 0.025)
+    : 0;
+  return candidateUtilityScore(candidate, MODE_RULES.CONSERVATIVE) + microBonus + focusBonus + longshotBonus;
 }
 
 function classifyOpportunityType(
@@ -3283,6 +3348,7 @@ function candidateFromMarket(
   allMarkets: PredictionMarketQuote[],
   historyByTicker: Map<string, Array<{ recordedAt: string; yesBid: number | null; yesAsk: number | null; lastPrice: number | null }>>,
   adaptiveGates: AdaptiveGateContext,
+  strategyPerformanceProfile: StrategyPerformanceProfile | null,
 ): PredictionCandidate | null {
   const relatedMarkets = allMarkets.filter((candidate) => candidate.ticker !== market.ticker && deriveRiskCluster(candidate) === deriveRiskCluster(market));
   const probabilityEstimate = estimateModelProbability(market, mode, inferredRegime, btcSpot, overlayContext, relatedMarkets, historyByTicker);
@@ -3417,6 +3483,46 @@ function candidateFromMarket(
   if (favoriteLongshotActive.supportsTrade) {
     strategyTags.push("FAVORITE_LONGSHOT_BIAS");
   }
+  const maxSpreadAllowed = isBtcMicro ? Math.min(0.19, rules.maxSpread + 0.035) : rules.maxSpread;
+  const minLiquidityRequired = isBtcMicro ? Math.max(0.12, rules.minLiquidityScore * 0.75) : rules.minLiquidityScore;
+  const minEdgeRequired = isBtcMicro ? Math.max(0.0045, rules.minEdge * 0.65) : rules.minEdge;
+  const confidenceRequired = isBtcMicro ? Math.max(0.4, rules.confidenceFloor - 0.06) : rules.confidenceFloor;
+  const btcMicroLongshotBase = evaluateBitcoinMicroLongshot({
+    enabled: controls.bitcoinMicroLongshotEnabled,
+    isBitcoin: market.category === "BITCOIN",
+    timeToCloseDays,
+    focusHorizonDays: BITCOIN_FOCUS_HORIZON_DAYS,
+    microHorizonDays: BITCOIN_MICRO_HORIZON_DAYS,
+    modelProb: rulebookEstimate.prob,
+    marketProb: chosenMarketProb,
+    edge,
+    confidence,
+    spread,
+    liquidityScore,
+    highProbModelFloor: rules.highProbMinModelProb,
+    marketProbabilityCeiling: controls.bitcoinMicroLongshotMarketMax,
+    minGap: controls.bitcoinMicroLongshotMinGap,
+    minEdge: Math.max(BITCOIN_MICRO_LONGSHOT_EDGE_MIN, rules.minEdge * 0.72),
+    minConfidence: Math.max(BITCOIN_MICRO_LONGSHOT_CONFIDENCE_MIN, confidenceRequired - 0.03),
+    maxSpread: Math.min(maxSpreadAllowed, BITCOIN_MICRO_LONGSHOT_MAX_SPREAD),
+    minLiquidityScore: Math.max(BITCOIN_MICRO_LONGSHOT_MIN_LIQUIDITY, minLiquidityRequired),
+    sizeScale: timeToCloseDays <= BITCOIN_FOCUS_HORIZON_DAYS
+      ? BITCOIN_MICRO_LONGSHOT_FOCUS_SIZE_SCALE
+      : BITCOIN_MICRO_LONGSHOT_OUTER_SIZE_SCALE,
+  });
+  const btcMicroLongshotPreQualified = btcMicroLongshotBase?.eligible ?? false;
+  const btcMicroLongshotBaseWithExecution =
+    btcMicroLongshotBase
+      ? {
+          ...btcMicroLongshotBase,
+          modelProbabilityFloor: Math.max(btcMicroLongshotBase.modelProbabilityFloor, BITCOIN_MICRO_LONGSHOT_MODEL_FLOOR),
+          maxToxicity: BITCOIN_MICRO_LONGSHOT_MAX_TOXICITY,
+          executionAdjustedEdgeFloor: BITCOIN_MICRO_LONGSHOT_EXEC_EDGE_MIN,
+        }
+      : null;
+  if (btcMicroLongshotPreQualified) {
+    strategyTags.push("BTC_MICRO_LONGSHOT");
+  }
 
   const globalHighProbability = meetsGlobalHighProbabilityDefinition({
     category: market.category,
@@ -3427,11 +3533,6 @@ function candidateFromMarket(
     edge,
     confidence,
   });
-
-  const maxSpreadAllowed = isBtcMicro ? Math.min(0.19, rules.maxSpread + 0.035) : rules.maxSpread;
-  const minLiquidityRequired = isBtcMicro ? Math.max(0.12, rules.minLiquidityScore * 0.75) : rules.minLiquidityScore;
-  const minEdgeRequired = isBtcMicro ? Math.max(0.0045, rules.minEdge * 0.65) : rules.minEdge;
-  const confidenceRequired = isBtcMicro ? Math.max(0.4, rules.confidenceFloor - 0.06) : rules.confidenceFloor;
 
   const secondaryMinEdge = isBtcMicro
     ? Math.max(0.0035, (rules.secondaryMinEdge ?? (minEdgeRequired * 0.85)) * 0.85)
@@ -3456,16 +3557,23 @@ function candidateFromMarket(
   const highProbabilityQualified =
     !controls.highProbabilityEnabled ||
     globalHighProbability.qualified ||
-    favoriteLongshotActive.autoExecute;
+    favoriteLongshotActive.autoExecute ||
+    btcMicroLongshotPreQualified;
 
   if (price <= 0.01 || price >= 0.99) return null;
   if (spread > maxSpreadAllowed || liquidityScore < minLiquidityRequired) return null;
-  if (favoriteLongshotActive.shouldFadeCheapYes && coherenceAdjustment.coherenceEdge <= 0.01 && !robustRulebookPass) return null;
+  if (
+    favoriteLongshotActive.shouldFadeCheapYes &&
+    coherenceAdjustment.coherenceEdge <= 0.01 &&
+    !robustRulebookPass &&
+    !btcMicroLongshotPreQualified
+  ) return null;
   if (!highProbabilityQualified) return null;
 
   let isSecondaryEntry = false;
   let usedHighProbabilityLane = false;
   let usedFavoriteLongshotBias = false;
+  let usedBitcoinMicroLongshot = false;
   let usedRulebookArbitrage = false;
   let usedSyntheticOverlay = false;
   const primaryPass = highProbabilityQualified && edge >= minEdgeRequired && confidence >= confidenceRequired;
@@ -3476,10 +3584,12 @@ function candidateFromMarket(
       spread <= secondaryMaxSpread &&
       liquidityScore >= secondaryMinLiquidityScore;
 
-    if (!secondaryPass && !highProbLowEvPass && !favoriteLongshotActive.autoExecute) return null;
+    if (!secondaryPass && !highProbLowEvPass && !favoriteLongshotActive.autoExecute && !btcMicroLongshotPreQualified) return null;
     isSecondaryEntry = secondaryPass;
     usedHighProbabilityLane = !secondaryPass && highProbLowEvPass;
     usedFavoriteLongshotBias = !secondaryPass && !highProbLowEvPass && favoriteLongshotActive.autoExecute;
+    usedBitcoinMicroLongshot =
+      !secondaryPass && !highProbLowEvPass && !favoriteLongshotActive.autoExecute && btcMicroLongshotPreQualified;
     usedRulebookArbitrage = false;
     usedSyntheticOverlay = false;
   }
@@ -3497,8 +3607,24 @@ function candidateFromMarket(
       highProbLaneStakeCap,
     ),
   );
+  const btcMicroLongshotStakeCap = Math.max(
+    price,
+    Math.min(
+      maxDailyRiskUsd * (btcMicroLongshotBaseWithExecution?.focusWindow ? 0.12 : 0.09),
+      accountBalance * rules.perTradeRiskPct * (btcMicroLongshotBaseWithExecution?.focusWindow ? 0.34 : 0.26),
+    ),
+  );
+  const btcMicroLongshotStake = Math.max(
+    price,
+    Math.min(
+      baseStake * (btcMicroLongshotBaseWithExecution?.sizeScale ?? BITCOIN_MICRO_LONGSHOT_OUTER_SIZE_SCALE),
+      btcMicroLongshotStakeCap,
+    ),
+  );
   const plannedStake = usedHighProbabilityLane
     ? highProbabilityLaneStake
+    : usedBitcoinMicroLongshot
+      ? btcMicroLongshotStake
     : isSecondaryEntry
       ? Math.max(price, baseStake * rules.secondaryStakeScale)
       : baseStake;
@@ -3604,6 +3730,20 @@ function candidateFromMarket(
   const probabilityAlphaUsd = contracts * (rulebookEstimate.prob - executionPrice);
   const robustAlphaUsd = contracts * (rulebookEstimate.lower - executionPrice);
   const executionAdjustedEdge = edge + executionAlpha.valuePerContract - uncertaintyWidth * 0.08 - executionHealth.scorePenalty;
+  const btcMicroLongshot =
+    btcMicroLongshotBaseWithExecution
+      ? {
+          ...btcMicroLongshotBaseWithExecution,
+          stakeCapUsd: Number(btcMicroLongshotStakeCap.toFixed(4)),
+        }
+      : null;
+  const btcMicroLongshotExecutionPass = Boolean(
+    btcMicroLongshot &&
+      btcMicroLongshot.eligible &&
+      executionAdjustedEdge >= btcMicroLongshot.executionAdjustedEdgeFloor &&
+      executionAlpha.toxicityScore <= btcMicroLongshot.maxToxicity,
+  );
+  if (usedBitcoinMicroLongshot && !btcMicroLongshotExecutionPass) return null;
   const netAlphaUsd =
     probabilityAlphaUsd -
     feeEstimate.totalUsd +
@@ -3611,12 +3751,27 @@ function candidateFromMarket(
     coherenceUsd +
     executionAlphaUsd;
   const evAllIn = netAlphaUsd;
-  const compositeScore =
+  const baseCompositeScore =
     capitalLocked > 0 && capitalTimeDays > 0
       ? ((robustAlphaUsd - feeEstimate.totalUsd + coherenceUsd + executionAlphaUsd + incentiveEstimate.totalUsd) / (capitalLocked * capitalTimeDays)) -
         executionHealth.scorePenalty * 0.08 -
         executionAlpha.toxicityScore * 0.02
       : -1;
+  const strategyPerformanceAdjustment = evaluateStrategyPerformanceAdjustment({
+    candidate: {
+      category: market.category,
+      strategyTags: [...new Set(strategyTags)],
+      timeToCloseDays,
+    },
+    profile: strategyPerformanceProfile,
+    enabled: controls.strategyPerformanceEnabled,
+    maxBoost: controls.strategyPerformanceMaxBoost,
+    focusHorizonDays: BITCOIN_FOCUS_HORIZON_DAYS,
+  });
+  const compositeScore =
+    baseCompositeScore <= -1
+      ? baseCompositeScore
+      : Number((baseCompositeScore + strategyPerformanceAdjustment.scoreBoost).toFixed(6));
 
   if (isBtcMicro) {
     rationale.push("BTC micro-horizon pathway active (targeting <=60m contracts, favoring 15m windows).");
@@ -3657,6 +3812,12 @@ function candidateFromMarket(
   rationale.push(
     `Robust score ${(compositeScore).toFixed(5)} per capital-day using q_robust, capital locked $${capitalLocked.toFixed(2)} over ${capitalTimeDays.toFixed(4)} days.`,
   );
+  if (strategyPerformanceAdjustment.scoreBoost !== 0) {
+    rationale.push(
+      `Recent winner bias added ${strategyPerformanceAdjustment.scoreBoost.toFixed(5)} to the capital-time score from realized strategy performance.`,
+    );
+    rationale.push(...strategyPerformanceAdjustment.reasons);
+  }
   rationale.push(
     `Execution plan uses ${executionAlpha.assumedRole} routing at ${(executionPrice * 100).toFixed(1)}c with patience ${executionAlpha.patienceHours.toFixed(2)}h and fee schedule ${feeEstimate.schedule}.`,
   );
@@ -3679,6 +3840,14 @@ function candidateFromMarket(
   if (favoriteLongshotActive.shouldFadeCheapYes) {
     rationale.push("Favorite-longshot bias warning: cheap YES longshot detected; this path is structurally disfavored unless another strategy dominates.");
   }
+  if (btcMicroLongshot) {
+    rationale.push(
+      `BTC micro longshot scan: selected-side model ${(rulebookEstimate.prob * 100).toFixed(1)}% vs implied ${(chosenMarketProb * 100).toFixed(1)}% | gap ${(btcMicroLongshot.probabilityGap * 100).toFixed(2)} pts | ceiling ${(btcMicroLongshot.marketProbabilityCeiling * 100).toFixed(0)}% | ${btcMicroLongshot.focusWindow ? "15m focus window" : "<=60m outer micro window"}.`,
+    );
+    rationale.push(
+      `BTC micro longshot execution filters: max spread ${(btcMicroLongshot.maxSpread * 100).toFixed(1)}%, min liquidity ${(btcMicroLongshot.minLiquidityScore * 100).toFixed(0)}%, max toxicity ${(btcMicroLongshot.maxToxicity * 100).toFixed(0)}%, min exec-adjusted edge ${(btcMicroLongshot.executionAdjustedEdgeFloor * 100).toFixed(2)}%.`,
+    );
+  }
 
   if (usedHighProbabilityLane) {
     rationale.push(
@@ -3692,6 +3861,11 @@ function candidateFromMarket(
       );
     }
   }
+  if (usedBitcoinMicroLongshot) {
+    rationale.push(
+      `BTC micro longshot lane active: low-implied-probability selected side cleared ${(btcMicroLongshot?.minGap ?? 0) * 100}% gap requirement with stake capped at $${btcMicroLongshotStakeCap.toFixed(2)}.`,
+    );
+  }
 
   rationale.push(
     usedRulebookArbitrage
@@ -3700,6 +3874,8 @@ function candidateFromMarket(
       ? "Synthetic hedge / relative-value overlay entry: executable option-spread band still clears price after mismatch and friction penalties."
       : usedFavoriteLongshotBias
       ? "Favorite-longshot bias entry: high-priced favorite selected because model-implied gap cleared the 10-point execution threshold."
+      : usedBitcoinMicroLongshot
+      ? "BTC micro longshot entry: low-implied BTC side cleared dedicated model-implied gap, spread, toxicity, and capped-size requirements."
       : usedHighProbabilityLane
       ? "Primary/secondary edge thresholds not met; allowed under high-probability low-EV policy."
       : isSecondaryEntry
@@ -3720,7 +3896,11 @@ function candidateFromMarket(
     rules,
   );
   const opportunityType: OpportunityType =
-    (usedFavoriteLongshotBias || usedRulebookArbitrage || usedSyntheticOverlay) && derivedOpportunityType !== "PASS" ? "TRADE" : derivedOpportunityType;
+    usedBitcoinMicroLongshot && derivedOpportunityType === "PASS"
+      ? "WATCHLIST"
+      : (usedFavoriteLongshotBias || usedRulebookArbitrage || usedSyntheticOverlay) && derivedOpportunityType !== "PASS"
+        ? "TRADE"
+        : derivedOpportunityType;
   const watchlistExecutionEligible =
     opportunityType === "WATCHLIST" &&
     edge > 0 &&
@@ -3728,6 +3908,7 @@ function candidateFromMarket(
     confidence >= Math.max(0.34, rules.highProbMinConfidence - 0.06) &&
     (
       isSecondaryEntry ||
+      usedBitcoinMicroLongshot ||
       usedHighProbabilityLane ||
       usedRulebookArbitrage ||
       usedSyntheticOverlay ||
@@ -3856,6 +4037,7 @@ function candidateFromMarket(
     uncertaintyWidth: Number(uncertaintyWidth.toFixed(6)),
     toxicityScore: Number(executionAlpha.toxicityScore.toFixed(6)),
     riskCluster,
+    btcMicroLongshot: btcMicroLongshot ?? undefined,
     silentClock: silentClockContribution ?? undefined,
     leadLag: leadLagContribution ?? undefined,
     executionPlan: {
@@ -3886,6 +4068,8 @@ function candidateFromMarket(
     simulated: true,
     executionHealthRegime: executionHealth.regime,
     executionHealthPenalty: Number(executionHealth.markoutPenalty.toFixed(6)),
+    strategyPerformanceBoost: strategyPerformanceAdjustment.scoreBoost,
+    strategyPerformanceReasons: strategyPerformanceAdjustment.reasons,
     executionStatus: "SKIPPED",
     executionMessage: usedRulebookArbitrage
       ? "Rulebook arbitrage candidate: robust interval cleared price after cost margin."
@@ -3893,6 +4077,8 @@ function candidateFromMarket(
       ? "Synthetic hedge / relative-value candidate: options band supports executable overlay after mismatch penalty."
       : usedFavoriteLongshotBias
       ? "Favorite-longshot bias execution candidate: model-implied gap cleared the 10-point trigger."
+      : usedBitcoinMicroLongshot
+      ? "BTC micro longshot candidate: low-implied BTC side cleared dedicated gap/spread/toxicity filters with capped sizing."
       : usedHighProbabilityLane
       ? watchlistExecutionEligible
         ? "High-probability lane promoted from watchlist to live-eligible execution."
@@ -3962,9 +4148,15 @@ function selectDiversifiedCandidates(
     const preferredBtc = preferredPool.length
       ? [...preferredPool].sort((a, b) => bitcoinMainstayScore(b) - bitcoinMainstayScore(a))[0]
       : null;
+    const preferredBtcLongshot = btcMicro
+      .filter((candidate) => isBitcoinMicroLongshotCandidate(candidate))
+      .sort((a, b) => bitcoinMainstayScore(b) - bitcoinMainstayScore(a))[0];
 
     if (preferredBtc) {
       addCandidate(preferredBtc);
+    }
+    if (preferredBtcLongshot) {
+      addCandidate(preferredBtcLongshot);
     }
   }
 
@@ -4703,6 +4895,23 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const riskClusterByTicker = new Map(markets.map((market) => [market.ticker.toUpperCase(), deriveRiskCluster(market)] as const));
   const historyByTicker = getKalshiRecentMarketHistoryStream(markets.map((market) => market.ticker));
   const openPositionConstraint = buildOpenExposureConstraint(existingPositions, existingOrders, marketsByTicker, riskClusterByTicker);
+  const liveQuoteCache = new Map<string, Awaited<ReturnType<typeof getKalshiMarketQuotes>>[string] | null>();
+
+  async function confirmTradableMarket(ticker: string) {
+    const key = ticker.toUpperCase().trim();
+    if (!key) return null;
+    const scanMarket = marketsByTicker.get(key);
+    if (scanMarket && !isTradableKalshiStatus(scanMarket.status)) return null;
+    if (liveQuoteCache.has(key)) return liveQuoteCache.get(key) ?? null;
+    const quotes = await getKalshiMarketQuotes([key]).catch(() => ({} as Awaited<ReturnType<typeof getKalshiMarketQuotes>>));
+    const quote = quotes[key] ?? null;
+    if (!quote || !isTradableKalshiStatus(quote.marketStatus)) {
+      liveQuoteCache.set(key, null);
+      return null;
+    }
+    liveQuoteCache.set(key, quote);
+    return quote;
+  }
 
   const initialBalances = await getKalshiDemoBalancesUsd().catch(() => ({ cashUsd: null, portfolioUsd: null }));
   await persistKalshiBalanceSnapshot({
@@ -4719,7 +4928,17 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     warnings.push("Private stream bootstrap is event-primed rather than fully acked; execution attribution will flag this run.");
   }
 
-  const priorAttribution = await loadExecutionAttributionSummary({ lookbackHours: 72, recentTradeLimit: 12, bucketLimit: 6 }).catch(() => null);
+  const strategyPerformanceLookbackHours = 96;
+  const priorAttribution = await loadExecutionAttributionSummary({
+    lookbackHours: strategyPerformanceLookbackHours,
+    recentTradeLimit: 200,
+    bucketLimit: 8,
+  }).catch(() => null);
+  const strategyPerformanceProfile = buildStrategyPerformanceProfile({
+    attribution: priorAttribution,
+    lookbackHours: strategyPerformanceLookbackHours,
+    maxBoost: controls.strategyPerformanceMaxBoost,
+  });
   const learningOutput = priorAttribution
     ? buildFalseNegativeLearning({
         attribution: priorAttribution,
@@ -4739,6 +4958,15 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   rules = learningApplied.rules;
   warnings.push(...learningApplied.notes);
   const adaptiveGates = learningApplied.gates;
+  if (controls.strategyPerformanceEnabled && strategyPerformanceProfile?.topTags.length) {
+    const leaders = strategyPerformanceProfile.topTags
+      .filter((slice) => slice.recommendedBoost > 0)
+      .slice(0, 3)
+      .map((slice) => `${slice.key} ${slice.recommendedBoost.toFixed(4)}`);
+    if (leaders.length) {
+      warnings.push(`Recent winner bias active: ${leaders.join(", ")}.`);
+    }
+  }
 
   const inferredRegime = detectGlobalRegime(markets);
   const mathContext = buildMarketMathContext(markets);
@@ -4749,6 +4977,68 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }).catch(() => {
     warnings.push("Storage warning: failed to persist market scan snapshot.");
   });
+
+  async function refreshBitcoinExecutionCandidate(staleCandidate: PredictionCandidate) {
+    if (staleCandidate.category !== "BITCOIN") return null;
+
+    const refreshedMarkets = await getKalshiOpenMarketsStream(["BITCOIN"], 360).catch(() => []);
+    if (!refreshedMarkets.length) return null;
+    const refreshedHistoryByTicker = getKalshiRecentMarketHistoryStream(refreshedMarkets.map((market) => market.ticker));
+    const refreshedMathContext = buildMarketMathContext(refreshedMarkets);
+    const refreshedOverlayContext = await buildOverlayContext(refreshedMarkets);
+    const wantsLongshot = staleCandidate.strategyTags?.includes("BTC_MICRO_LONGSHOT") ?? false;
+
+    const refreshedCandidates = refreshedMarkets
+      .map((market) =>
+        candidateFromMarket(
+          market,
+          mode,
+          rules,
+          controls,
+          accountBalanceUsd,
+          inferredRegime,
+          btcSpot,
+          maxDailyRiskUsd,
+          refreshedMathContext,
+          refreshedOverlayContext,
+          executionHealth,
+          refreshedMarkets,
+          refreshedHistoryByTicker,
+          adaptiveGates,
+          strategyPerformanceProfile,
+        ),
+      )
+      .filter((candidate): candidate is PredictionCandidate => candidate !== null);
+
+    const refreshedFiltered = filterExistingPositionCandidates(refreshedCandidates, openPositionConstraint, controls).filtered
+      .filter((candidate) => isBuyVerdict(candidate.verdict))
+      .filter((candidate) => candidate.side === staleCandidate.side)
+      .filter((candidate) => (candidate.timeToCloseDays ?? 99) <= BITCOIN_MICRO_HORIZON_DAYS)
+      .filter((candidate) => !wantsLongshot || candidate.strategyTags?.includes("BTC_MICRO_LONGSHOT"))
+      .sort((left, right) => {
+        const leftDistance = Math.abs((left.timeToCloseDays ?? BITCOIN_FOCUS_HORIZON_DAYS) - (staleCandidate.timeToCloseDays ?? BITCOIN_FOCUS_HORIZON_DAYS));
+        const rightDistance = Math.abs((right.timeToCloseDays ?? BITCOIN_FOCUS_HORIZON_DAYS) - (staleCandidate.timeToCloseDays ?? BITCOIN_FOCUS_HORIZON_DAYS));
+        if (Math.abs(leftDistance - rightDistance) > 0.0005) return leftDistance - rightDistance;
+        const rightEdge = right.executionAdjustedEdge ?? right.edge;
+        const leftEdge = left.executionAdjustedEdge ?? left.edge;
+        if (Math.abs(rightEdge - leftEdge) > 0.0001) return rightEdge - leftEdge;
+        return (right.compositeScore ?? -1) - (left.compositeScore ?? -1);
+      });
+
+    const replacement = refreshedFiltered[0];
+    if (!replacement) return null;
+
+    return {
+      ...replacement,
+      riskCluster: staleCandidate.riskCluster ?? replacement.riskCluster,
+      rationale: [
+        `BTC hot refresh retargeted stale ticker ${staleCandidate.ticker} to ${replacement.ticker} before live placement.`,
+        ...replacement.rationale,
+      ],
+      executionMessage: `Retargeted from stale BTC ticker ${staleCandidate.ticker} to current market ${replacement.ticker}.`,
+    };
+  }
+
   const liquidationDecisions: LiquidationDecision[] = controls.liquidationAdvisoryEnabled
     ? existingPositions
         .map((position) => {
@@ -4771,6 +5061,25 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     }).catch(() => {
       warnings.push("Storage warning: failed to persist liquidation decisions.");
     });
+  }
+  const bitcoinRiskExitDecisions = existingPositions
+    .map((position) => {
+      const market = marketsByTicker.get(position.ticker.toUpperCase());
+      if (!market) return null;
+      return evaluateBitcoinRiskExit({
+        position,
+        market,
+        stopLossPct: BITCOIN_STOP_LOSS_PCT,
+        takeProfitPct: BITCOIN_TAKE_PROFIT_PCT,
+      });
+    })
+    .filter((decision): decision is NonNullable<ReturnType<typeof evaluateBitcoinRiskExit>> => decision !== null);
+  if (bitcoinRiskExitDecisions.length) {
+    warnings.push(
+      `Detected ${bitcoinRiskExitDecisions.length} BTC risk exit trigger${bitcoinRiskExitDecisions.length === 1 ? "" : "s"} at ${(
+        BITCOIN_STOP_LOSS_PCT * 100
+      ).toFixed(0)}% stop / ${(BITCOIN_TAKE_PROFIT_PCT * 100).toFixed(0)}% take-profit.`,
+    );
   }
   const markoutDiagnostics = await refreshMarkoutTelemetry(recentFills, markets).catch(() => null);
   const markoutPenalty = markoutDiagnostics
@@ -4812,6 +5121,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         markets,
         historyByTicker,
         adaptiveGates,
+        strategyPerformanceProfile,
       ),
     )
     .filter((candidate): candidate is PredictionCandidate => candidate !== null);
@@ -4944,6 +5254,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
           markets,
           historyByTicker,
           adaptiveGates,
+          strategyPerformanceProfile,
         ),
       )
         .filter((candidate): candidate is PredictionCandidate => candidate !== null)
@@ -5202,26 +5513,68 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     for (const decision of orderMaintenanceDecisions) {
       if (decision.action === "KEEP") continue;
       try {
+        const incumbentOrder = existingOrders.find((order) => order.order_id === decision.orderId);
+        if (!incumbentOrder) continue;
+        const side: PredictionSide = incumbentOrder.side === "yes" ? "YES" : "NO";
+        const tradableQuote = await confirmTradableMarket(incumbentOrder.ticker);
+        if (!tradableQuote) {
+          warnings.push(
+            `Order maintenance skipped for ${decision.ticker}: market ${incumbentOrder.ticker} is no longer tradable in the current environment.`,
+          );
+          continue;
+        }
+
         await cancelKalshiDemoOrder(decision.orderId);
         if (decision.action === "REPRICE" && decision.suggestedPriceCents !== null) {
-          const incumbentOrder = existingOrders.find((order) => order.order_id === decision.orderId);
-          if (incumbentOrder) {
-            const side: PredictionSide = incumbentOrder.side === "yes" ? "YES" : "NO";
-            const count = incumbentOrder.remaining_count ?? incumbentOrder.count;
-            await placeKalshiDemoOrder({
-              ticker: incumbentOrder.ticker,
-              side,
-              count,
-              limitPriceCents: decision.suggestedPriceCents,
-              contractStep: Math.max(0.01, count < 1 ? 0.01 : 1),
-              orderGroupId: incumbentOrder.order_group_id,
-              clientOrderId: buildAutomationClientOrderId(runId, { ticker: incumbentOrder.ticker, side }, 9000 + orderMaintenanceHandledKeys.size),
-            });
-            orderMaintenanceHandledKeys.add(`${incumbentOrder.ticker}:${side}`);
-          }
+          const count = incumbentOrder.remaining_count ?? incumbentOrder.count;
+          await placeKalshiDemoOrder({
+            ticker: incumbentOrder.ticker,
+            side,
+            count,
+            limitPriceCents: decision.suggestedPriceCents,
+            contractStep: Math.max(0.01, count < 1 ? 0.01 : 1),
+            orderGroupId: incumbentOrder.order_group_id,
+            clientOrderId: buildAutomationClientOrderId(runId, { ticker: incumbentOrder.ticker, side }, 9000 + orderMaintenanceHandledKeys.size),
+          });
+          orderMaintenanceHandledKeys.add(`${incumbentOrder.ticker}:${side}`);
         }
       } catch (error) {
         warnings.push(`Order maintenance ${decision.action.toLowerCase()} failed for ${decision.ticker}: ${(error as Error).message}`);
+      }
+    }
+  }
+  const bitcoinRiskExitTickers = new Set<string>();
+  if (canExecuteLive && bitcoinRiskExitDecisions.length) {
+    for (const decision of bitcoinRiskExitDecisions) {
+      try {
+        const tradableQuote = await confirmTradableMarket(decision.ticker);
+        if (!tradableQuote) {
+          warnings.push(`BTC risk exit skipped for ${decision.ticker}: market is no longer tradable.`);
+          continue;
+        }
+
+        const market = marketsByTicker.get(decision.ticker.toUpperCase());
+        await placeKalshiDemoOrder({
+          ticker: decision.ticker,
+          side: decision.exitSide,
+          action: "buy",
+          reduceOnly: true,
+          timeInForce: "immediate_or_cancel",
+          count: decision.contracts,
+          limitPriceCents: decision.exitLimitPriceCents,
+          contractStep: market ? marketContractStep(market) : 1,
+          clientOrderId: buildAutomationClientOrderId(runId, { ticker: decision.ticker, side: decision.exitSide }, 7000 + bitcoinRiskExitTickers.size),
+        });
+        bitcoinRiskExitTickers.add(decision.ticker.toUpperCase());
+        warnings.push(
+          `${decision.trigger === "STOP_LOSS" ? "BTC stop loss" : "BTC take profit"} exit submitted for ${decision.ticker} at ${(decision.unrealizedReturnPct * 100).toFixed(2)}%.`,
+        );
+      } catch (error) {
+        if (isKalshiMarketNotFoundError(error)) {
+          warnings.push(`BTC risk exit skipped for ${decision.ticker}: Kalshi reported market_not_found while attempting the exit.`);
+          continue;
+        }
+        warnings.push(`BTC risk exit failed for ${decision.ticker}: ${(error as Error).message}`);
       }
     }
   }
@@ -5251,6 +5604,17 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   for (const [index, candidate] of executionQueue.entries()) {
     const key = candidateKey(candidate);
     const isActionable = actionableKeys.has(key);
+    if (bitcoinRiskExitTickers.has(candidate.ticker.toUpperCase())) {
+      executedCandidates.push({
+        ...candidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
+        ...executionMetadata,
+        simulated: !canExecuteLive,
+        executionStatus: "SKIPPED",
+        executionMessage: "Skipped because a BTC stop-loss/take-profit exit was already submitted for this market this cycle.",
+      });
+      continue;
+    }
     if (orderMaintenanceHandledKeys.has(key)) {
       executedCandidates.push({
         ...candidate,
@@ -5358,16 +5722,38 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
     }
 
     try {
-      if (candidate.incumbentComparison?.accepted && candidate.incumbentComparison.action === "REPLACE_ORDER" && candidate.incumbentComparison.incumbentOrderId) {
-        await cancelKalshiDemoOrder(candidate.incumbentComparison.incumbentOrderId);
+      let executionCandidate = candidate;
+      let tradableQuote = await confirmTradableMarket(executionCandidate.ticker);
+      if (!tradableQuote && executionCandidate.category === "BITCOIN") {
+        const refreshedCandidate = await refreshBitcoinExecutionCandidate(executionCandidate);
+        if (refreshedCandidate) {
+          executionCandidate = refreshedCandidate;
+          tradableQuote = await confirmTradableMarket(executionCandidate.ticker);
+          warnings.push(`Retargeted stale BTC candidate ${candidate.ticker} to live market ${executionCandidate.ticker} before placement.`);
+        }
       }
-      const clientOrderId = buildAutomationClientOrderId(runId, candidate, index);
+      if (!tradableQuote) {
+        executedCandidates.push({
+          ...executionCandidate,
+          gateDiagnostics: withRuntimeGateDiagnostics(executionCandidate),
+          ...executionMetadata,
+          simulated: true,
+          executionStatus: "SKIPPED",
+          executionMessage: `Market ${executionCandidate.ticker} is no longer tradable in the current Kalshi environment; skipped before live placement.`,
+        });
+        warnings.push(`Skipped ${executionCandidate.ticker}: market disappeared or is no longer tradable before order placement.`);
+        continue;
+      }
+      if (executionCandidate.incumbentComparison?.accepted && executionCandidate.incumbentComparison.action === "REPLACE_ORDER" && executionCandidate.incumbentComparison.incumbentOrderId) {
+        await cancelKalshiDemoOrder(executionCandidate.incumbentComparison.incumbentOrderId);
+      }
+      const clientOrderId = buildAutomationClientOrderId(runId, executionCandidate, index);
       const placement = await placeKalshiDemoOrder({
-        ticker: candidate.ticker,
-        side: candidate.side,
-        count: candidate.recommendedContracts,
-        limitPriceCents: candidate.limitPriceCents,
-        contractStep: candidate.contractStep,
+        ticker: executionCandidate.ticker,
+        side: executionCandidate.side,
+        count: executionCandidate.recommendedContracts,
+        limitPriceCents: executionCandidate.limitPriceCents,
+        contractStep: executionCandidate.contractStep,
         orderGroupId: clusterGuard.orderGroupId,
         clientOrderId,
       });
@@ -5379,20 +5765,81 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       const executionClientOrderId =
         String(placementRecord.client_order_id ?? clientOrderId ?? "").trim() || clientOrderId;
 
-      executedStake += candidate.recommendedStakeUsd;
+      executedStake += executionCandidate.recommendedStakeUsd;
 
       executedCandidates.push({
-        ...candidate,
-        gateDiagnostics: withRuntimeGateDiagnostics(candidate),
+        ...executionCandidate,
+        gateDiagnostics: withRuntimeGateDiagnostics(executionCandidate),
         ...executionMetadata,
         simulated: false,
         executionStatus: "PLACED",
         executionOrderId,
         executionClientOrderId,
-        executionMessage: `Order placed on Kalshi demo (${candidate.recommendedContracts} contracts, group ${clusterGuard.orderGroupId}).`,
+        executionMessage: `Order placed on Kalshi demo (${executionCandidate.recommendedContracts} contracts, group ${clusterGuard.orderGroupId}).`,
       });
     } catch (error) {
       const clientOrderId = buildAutomationClientOrderId(runId, candidate, index);
+      if (isKalshiMarketNotFoundError(error)) {
+        if (candidate.category === "BITCOIN") {
+          const refreshedCandidate = await refreshBitcoinExecutionCandidate(candidate);
+          if (refreshedCandidate && refreshedCandidate.ticker !== candidate.ticker) {
+            const refreshedClientOrderId = buildAutomationClientOrderId(runId, refreshedCandidate, index);
+            try {
+              const retryPlacement = await placeKalshiDemoOrder({
+                ticker: refreshedCandidate.ticker,
+                side: refreshedCandidate.side,
+                count: refreshedCandidate.recommendedContracts,
+                limitPriceCents: refreshedCandidate.limitPriceCents,
+                contractStep: refreshedCandidate.contractStep,
+                orderGroupId: clusterGuard.orderGroupId,
+                clientOrderId: refreshedClientOrderId,
+              });
+              const retryPlacementRecord =
+                retryPlacement && typeof retryPlacement === "object" && "order" in retryPlacement && retryPlacement.order && typeof retryPlacement.order === "object"
+                  ? (retryPlacement.order as Record<string, unknown>)
+                  : (retryPlacement as Record<string, unknown>);
+              executedStake += refreshedCandidate.recommendedStakeUsd;
+              executedCandidates.push({
+                ...refreshedCandidate,
+                gateDiagnostics: withRuntimeGateDiagnostics(refreshedCandidate),
+                ...executionMetadata,
+                simulated: false,
+                executionStatus: "PLACED",
+                executionOrderId: String(retryPlacementRecord.order_id ?? retryPlacementRecord.id ?? "").trim() || undefined,
+                executionClientOrderId:
+                  String(retryPlacementRecord.client_order_id ?? refreshedClientOrderId ?? "").trim() || refreshedClientOrderId,
+                executionMessage: `Order placed on Kalshi demo after BTC ticker refresh (${candidate.ticker} -> ${refreshedCandidate.ticker}).`,
+              });
+              warnings.push(`Recovered BTC market_not_found by retargeting ${candidate.ticker} to ${refreshedCandidate.ticker}.`);
+              continue;
+            } catch (retryError) {
+              if (!isKalshiMarketNotFoundError(retryError)) {
+                executedCandidates.push({
+                  ...refreshedCandidate,
+                  gateDiagnostics: withRuntimeGateDiagnostics(refreshedCandidate),
+                  ...executionMetadata,
+                  simulated: true,
+                  executionStatus: "FAILED",
+                  executionClientOrderId: refreshedClientOrderId,
+                  executionMessage: (retryError as Error).message,
+                });
+                continue;
+              }
+            }
+          }
+        }
+        executedCandidates.push({
+          ...candidate,
+          gateDiagnostics: withRuntimeGateDiagnostics(candidate),
+          ...executionMetadata,
+          simulated: true,
+          executionStatus: "SKIPPED",
+          executionClientOrderId: clientOrderId,
+          executionMessage: `Market ${candidate.ticker} disappeared between scan and placement; skipped instead of retrying stale ticker.`,
+        });
+        warnings.push(`Skipped ${candidate.ticker}: Kalshi reported market_not_found during live placement.`);
+        continue;
+      }
       executedCandidates.push({
         ...candidate,
         gateDiagnostics: withRuntimeGateDiagnostics(candidate),

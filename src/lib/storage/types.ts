@@ -7,6 +7,7 @@ import type {
   ExecutionHealthRegime,
   ExecutionPlanRole,
   FalseNegativeLearningOutput,
+  BitcoinMicroLongshotSetup,
   LeadLagSignal,
   LiquidationDecision,
   OrderMaintenanceDecision,
@@ -201,6 +202,7 @@ export interface StoredCandidateDecisionEvent {
   leadLag?: LeadLagSignal;
   liquidationRecommendation?: LiquidationDecision;
   orderMaintenance?: OrderMaintenanceDecision;
+  btcMicroLongshot?: BitcoinMicroLongshotSetup;
   executionStatus?: "PLACED" | "SKIPPED" | "FAILED";
   executionMessage?: string;
   executionOrderId?: string;
@@ -208,6 +210,8 @@ export interface StoredCandidateDecisionEvent {
   bootstrapMode?: ExecutionBootstrapMode;
   executionHealthRegime?: ExecutionHealthRegime;
   executionHealthPenalty?: number;
+  strategyPerformanceBoost?: number;
+  strategyPerformanceReasons?: string[];
   strategyTags?: string[];
   executionPlan?: {
     limitPriceCents: number;
@@ -393,6 +397,7 @@ export function toStoredCandidateDecisionPayload(
     leadLag: candidate.leadLag,
     liquidationRecommendation: candidate.liquidationRecommendation,
     orderMaintenance: candidate.orderMaintenance,
+    btcMicroLongshot: candidate.btcMicroLongshot,
     executionStatus: candidate.executionStatus,
     executionMessage: candidate.executionMessage,
     executionOrderId: candidate.executionOrderId,
@@ -400,6 +405,8 @@ export function toStoredCandidateDecisionPayload(
     bootstrapMode: candidate.bootstrapMode,
     executionHealthRegime: candidate.executionHealthRegime,
     executionHealthPenalty: candidate.executionHealthPenalty,
+    strategyPerformanceBoost: candidate.strategyPerformanceBoost,
+    strategyPerformanceReasons: candidate.strategyPerformanceReasons,
     strategyTags: candidate.strategyTags,
     executionPlan: candidate.executionPlan
       ? {

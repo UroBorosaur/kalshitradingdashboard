@@ -47,14 +47,24 @@ export function useDashboardData() {
   const liveAccounts = useMemo(() => mapAlpacaAccount(live.snapshot.account), [live.snapshot.account]);
   const liveEquity = useMemo(() => mapAlpacaEquityHistory(live.snapshot.equityHistory), [live.snapshot.equityHistory]);
   const kalshiTitlesByTicker = useMemo(
-    () =>
-      live.snapshot.kalshi.orders.reduce<Record<string, string>>((acc, order) => {
+    () => {
+      const out: Record<string, string> = {};
+
+      for (const [tickerRaw, quote] of Object.entries(live.snapshot.kalshi.quotes ?? {})) {
+        const ticker = String(tickerRaw ?? "").toUpperCase().trim();
+        const title = quote?.title?.trim();
+        if (ticker && title && title.toUpperCase() !== ticker) out[ticker] = title;
+      }
+
+      for (const order of live.snapshot.kalshi.orders) {
         const ticker = String(order.ticker ?? "").toUpperCase().trim();
         const title = order.title?.trim();
-        if (ticker && title && !acc[ticker]) acc[ticker] = title;
-        return acc;
-      }, {}),
-    [live.snapshot.kalshi.orders],
+        if (ticker && title && title.toUpperCase() !== ticker && !out[ticker]) out[ticker] = title;
+      }
+
+      return out;
+    },
+    [live.snapshot.kalshi.orders, live.snapshot.kalshi.quotes],
   );
   const liveTrades = useMemo(
     () =>
@@ -104,6 +114,7 @@ export function useDashboardData() {
             live.snapshot.account?.equity ??
             0,
         ),
+        kalshiTitlesByTicker,
       ).filter((trade) => trade.status !== "OPEN"),
     [
       live.snapshot.kalshi.orders,
@@ -112,6 +123,7 @@ export function useDashboardData() {
       live.snapshot.kalshi.portfolioUsd,
       live.snapshot.kalshi.balanceUsd,
       live.snapshot.kalshi.cashUsd,
+      kalshiTitlesByTicker,
       live.snapshot.account,
     ],
   );

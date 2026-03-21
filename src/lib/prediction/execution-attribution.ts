@@ -40,8 +40,10 @@ import type {
   ExecutionBootstrapMode,
   ExecutionHealthRegime,
   PredictionSide,
+  StrategyLanePerformanceSummary,
 } from "@/lib/prediction/types";
 import { reconcileKalshiExecution } from "@/lib/prediction/reconciliation";
+import { buildStrategyPerformanceProfile } from "@/lib/prediction/strategy-performance";
 
 const EXECUTED_CANDIDATE_SOURCE = "automation/executed-candidates";
 const DEFAULT_LOOKBACK_HOURS = 72;
@@ -133,6 +135,25 @@ interface OverlayAccumulator {
   expiryPnlUsdCount: number;
   toxicityOverlap: number;
   clusterStressOverlap: number;
+}
+
+interface StrategyLaneAccumulator {
+  decisions: number;
+  placed: number;
+  marketProbSum: number;
+  marketProbCount: number;
+  probabilityGapSum: number;
+  probabilityGapCount: number;
+  edgeSum: number;
+  edgeCount: number;
+  executionAdjustedEdgeSum: number;
+  executionAdjustedEdgeCount: number;
+  markout30sSum: number;
+  markout30sCount: number;
+  markoutExpirySum: number;
+  markoutExpiryCount: number;
+  netAlphaUsdSum: number;
+  netAlphaUsdCount: number;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -509,6 +530,71 @@ function createOverlayAccumulator(): OverlayAccumulator {
   };
 }
 
+function createStrategyLaneAccumulator(): StrategyLaneAccumulator {
+  return {
+    decisions: 0,
+    placed: 0,
+    marketProbSum: 0,
+    marketProbCount: 0,
+    probabilityGapSum: 0,
+    probabilityGapCount: 0,
+    edgeSum: 0,
+    edgeCount: 0,
+    executionAdjustedEdgeSum: 0,
+    executionAdjustedEdgeCount: 0,
+    markout30sSum: 0,
+    markout30sCount: 0,
+    markoutExpirySum: 0,
+    markoutExpiryCount: 0,
+    netAlphaUsdSum: 0,
+    netAlphaUsdCount: 0,
+  };
+}
+
+function applyStrategyLaneSample(accumulator: StrategyLaneAccumulator, trade: ExecutionAttributionTrade) {
+  accumulator.decisions += 1;
+  if (trade.executionStatus === "PLACED") accumulator.placed += 1;
+  accumulator.marketProbSum += trade.marketProb;
+  accumulator.marketProbCount += 1;
+  if (typeof trade.btcMicroLongshotProbabilityGap === "number" && Number.isFinite(trade.btcMicroLongshotProbabilityGap)) {
+    accumulator.probabilityGapSum += trade.btcMicroLongshotProbabilityGap;
+    accumulator.probabilityGapCount += 1;
+  }
+  accumulator.edgeSum += trade.edge;
+  accumulator.edgeCount += 1;
+  if (typeof trade.executionAdjustedEdge === "number" && Number.isFinite(trade.executionAdjustedEdge)) {
+    accumulator.executionAdjustedEdgeSum += trade.executionAdjustedEdge;
+    accumulator.executionAdjustedEdgeCount += 1;
+  }
+  if (typeof trade.markout30s === "number" && Number.isFinite(trade.markout30s)) {
+    accumulator.markout30sSum += trade.markout30s;
+    accumulator.markout30sCount += 1;
+  }
+  if (typeof trade.markoutExpiry === "number" && Number.isFinite(trade.markoutExpiry)) {
+    accumulator.markoutExpirySum += trade.markoutExpiry;
+    accumulator.markoutExpiryCount += 1;
+  }
+  if (typeof trade.netAlphaUsd === "number" && Number.isFinite(trade.netAlphaUsd)) {
+    accumulator.netAlphaUsdSum += trade.netAlphaUsd;
+    accumulator.netAlphaUsdCount += 1;
+  }
+}
+
+function finalizeStrategyLaneAccumulator(accumulator: StrategyLaneAccumulator): StrategyLanePerformanceSummary {
+  return {
+    decisions: accumulator.decisions,
+    placed: accumulator.placed,
+    fillRate: average(accumulator.placed, accumulator.decisions),
+    avgMarketProb: average(accumulator.marketProbSum, accumulator.marketProbCount),
+    avgProbabilityGap: average(accumulator.probabilityGapSum, accumulator.probabilityGapCount),
+    avgEdge: average(accumulator.edgeSum, accumulator.edgeCount),
+    avgExecutionAdjustedEdge: average(accumulator.executionAdjustedEdgeSum, accumulator.executionAdjustedEdgeCount),
+    avgMarkout30s: average(accumulator.markout30sSum, accumulator.markout30sCount),
+    avgMarkoutExpiry: average(accumulator.markoutExpirySum, accumulator.markoutExpiryCount),
+    avgNetAlphaUsd: average(accumulator.netAlphaUsdSum, accumulator.netAlphaUsdCount),
+  };
+}
+
 function applyOverlaySample(args: {
   accumulator: OverlayAccumulator;
   trade: ExecutionAttributionTrade;
@@ -848,6 +934,7 @@ export function summarizeExecutionAttribution({
   const byBootstrap = new Map<string, BucketAccumulator>();
   const silentClockOverlay = createOverlayAccumulator();
   const leadLagOverlay = createOverlayAccumulator();
+  const bitcoinMicroLongshotLane = createStrategyLaneAccumulator();
   const falseNegativesByExpert = new Map<string, CounterfactualAccumulator>();
   const falseNegativesByCluster = new Map<string, CounterfactualAccumulator>();
   const falseNegativesByToxicity = new Map<string, CounterfactualAccumulator>();
@@ -916,6 +1003,8 @@ export function summarizeExecutionAttribution({
       leadLagProbabilityContribution: roundNullable(decision.leadLag?.probabilityDelta, 6),
       leadLagScoreContribution: roundNullable(decision.leadLag?.scoreContribution, 6),
       clusterStress,
+      strategyTags: (decision.strategyTags ?? []) as NonNullable<ExecutionAttributionTrade["strategyTags"]>,
+      btcMicroLongshotProbabilityGap: roundNullable(decision.btcMicroLongshot?.probabilityGap, 6),
       limitPriceCents: decision.limitPriceCents,
       executionRole: decision.executionPlan?.role,
       fillProbability: roundNullable(decision.executionPlan?.fillProbability),
@@ -960,6 +1049,9 @@ export function summarizeExecutionAttribution({
         probabilityContribution: decision.leadLag.probabilityDelta,
         scoreContribution: decision.leadLag.scoreContribution,
       });
+    }
+    if (decision.strategyTags?.includes("BTC_MICRO_LONGSHOT")) {
+      applyStrategyLaneSample(bitcoinMicroLongshotLane, trade);
     }
   }
 
@@ -1301,6 +1393,37 @@ export function summarizeExecutionAttribution({
   const leadLagPayloads = signalOverlays
     .map((event) => event.payload.leadLag)
     .filter((payload): payload is NonNullable<StoredSignalOverlayEvent["leadLag"]> => Boolean(payload));
+  const recentTradeSlice = trades.slice(0, clamp(recentTradeLimit, 1, 200));
+  const strategyPerformance = buildStrategyPerformanceProfile({
+    attribution: {
+      generatedAt: new Date().toISOString(),
+      lookbackHours,
+      totals: {
+        decisions: totals.decisions,
+        placed: totals.placed,
+        failed: totals.failed,
+        skipped: totals.skipped,
+        totalFilledContracts: Number(totals.totalFilledContracts.toFixed(4)),
+        avgNetAlphaUsd: average(totals.netAlphaSum, totals.netAlphaCount),
+        avgExecutionAdjustedEdge: average(totals.executionAdjustedEdgeSum, totals.executionAdjustedEdgeCount),
+        avgMarkout30s: average(totals.markout30sSum, totals.markout30sCount),
+        avgMarkout2m: average(totals.markout2mSum, totals.markout2mCount),
+        avgMarkoutExpiry: average(totals.markoutExpirySum, totals.markoutExpiryCount),
+        matchedReconciliations: totals.matchedReconciliations,
+        avgCashDeltaDriftUsd: average(totals.cashDeltaDriftSum, totals.cashDeltaDriftCount),
+        avgFeeDriftUsd: average(totals.feeDriftSum, totals.feeDriftCount),
+      },
+      byExpert: [],
+      byExecutionHealth: [],
+      byCluster: [],
+      byUncertaintyWidth: [],
+      byToxicity: [],
+      byBootstrap: [],
+      recentTrades: recentTradeSlice,
+    },
+    lookbackHours,
+    maxBoost: 0.0025,
+  });
 
   return {
     generatedAt: new Date().toISOString(),
@@ -1326,7 +1449,7 @@ export function summarizeExecutionAttribution({
     byUncertaintyWidth: finalizeBuckets(byUncertainty, bucketLimit),
     byToxicity: finalizeBuckets(byToxicity, bucketLimit),
     byBootstrap: finalizeBuckets(byBootstrap, bucketLimit),
-    recentTrades: trades.slice(0, clamp(recentTradeLimit, 1, 30)),
+    recentTrades: recentTradeSlice,
     replacement: {
       accepted: replacementAccepted.length,
       rejected: replacementRejected.length,
@@ -1403,6 +1526,10 @@ export function summarizeExecutionAttribution({
       recentSilentClock: silentClockPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
       recentLeadLag: leadLagPayloads.slice(0, clamp(recentTradeLimit, 1, 30)),
     },
+    strategyLanes: {
+      bitcoinMicroLongshot: finalizeStrategyLaneAccumulator(bitcoinMicroLongshotLane),
+    },
+    strategyPerformance: strategyPerformance ?? undefined,
     selectionControl: {
       executed: {
         count: placedExecutedDecisions.length,

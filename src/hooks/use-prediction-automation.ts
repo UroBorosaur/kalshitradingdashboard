@@ -32,6 +32,9 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   highProbMarketMin: 0.82,
   highProbabilityEnabled: true,
   favoriteLongshotEnabled: true,
+  bitcoinMicroLongshotEnabled: true,
+  bitcoinMicroLongshotMarketMax: 0.38,
+  bitcoinMicroLongshotMinGap: 0.035,
   throughputRecoveryEnabled: true,
   exploratoryFallbackEnabled: true,
   replacementEnabled: true,
@@ -42,6 +45,8 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   watchlistPromotionThreshold: 0.035,
   adaptiveLearningEnabled: false,
   liquidationAdvisoryEnabled: true,
+  strategyPerformanceEnabled: true,
+  strategyPerformanceMaxBoost: 0.0025,
 };
 
 function defaultCadence(mode: AutomationMode) {

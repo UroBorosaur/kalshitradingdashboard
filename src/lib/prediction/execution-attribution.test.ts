@@ -74,6 +74,24 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
         uncertaintyWidth: 0.03,
         toxicityScore: 0.24,
         riskCluster: "SPORTS:TEST-EVENT",
+        strategyTags: ["BTC_MICRO_LONGSHOT"],
+        btcMicroLongshot: {
+          eligible: true,
+          focusWindow: true,
+          probabilityGap: 0.06,
+          modelProbabilityFloor: 0.18,
+          marketProbabilityCeiling: 0.38,
+          minGap: 0.035,
+          minEdge: 0.005,
+          minConfidence: 0.36,
+          maxSpread: 0.09,
+          minLiquidityScore: 0.18,
+          maxToxicity: 0.48,
+          executionAdjustedEdgeFloor: 0.0025,
+          sizeScale: 0.38,
+          stakeCapUsd: 1.22,
+          rationale: "BTC micro longshot focus window.",
+        },
         executionStatus: "PLACED",
         executionMessage: "Order placed",
         executionOrderId: "order-1",
@@ -686,4 +704,8 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.overlays?.leadLagCount, 1);
   assert.equal(summary.overlays?.silentClockPerformance.decisions, 0);
   assert.equal(summary.overlays?.leadLagPerformance.decisions, 0);
+  assert.equal(summary.strategyLanes?.bitcoinMicroLongshot.decisions, 1);
+  assert.equal(summary.strategyLanes?.bitcoinMicroLongshot.placed, 1);
+  assert.equal(summary.strategyLanes?.bitcoinMicroLongshot.avgProbabilityGap, 0.06);
+  assert.equal(summary.strategyPerformance?.totalPlacedTrades, 1);
 });

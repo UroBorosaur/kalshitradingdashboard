@@ -324,6 +324,10 @@ async function kalshiRequestWithBase<T>(
 
   if (!response.ok) {
     const text = await response.text();
+    const normalized = text.toLowerCase();
+    if (response.status === 404 && (normalized.includes("market_not_found") || normalized.includes("market not found"))) {
+      throw new Error(`Kalshi market not found in this environment (${response.status}): ${text}`);
+    }
     throw new Error(`Kalshi request failed (${response.status}): ${text}`);
   }
 
@@ -489,6 +493,7 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
   if (!ticker) throw new Error("Kalshi order rejected locally: ticker is required.");
 
   const side = order.side === "NO" ? "no" : "yes";
+  const action = order.action === "sell" ? "sell" : "buy";
   const requestedCount = Number(Number(order.count) || 0);
   const requestedStep = Number(order.contractStep ?? 0);
   const contractStep = Math.max(
@@ -502,12 +507,14 @@ export async function placeKalshiDemoOrder(order: KalshiOrderRequest) {
   function buildBody(priceCents: number, includeClientOrderId: boolean) {
     const body: Record<string, unknown> = {
       ticker,
-      action: "buy",
+      action,
       side,
       type: "limit",
       count_fp: formatKalshiCountFp(count),
     };
     if (order.orderGroupId?.trim()) body.order_group_id = order.orderGroupId.trim();
+    if (order.reduceOnly) body.reduce_only = true;
+    if (order.timeInForce?.trim()) body.time_in_force = order.timeInForce.trim();
     if (Number.isInteger(count)) body.count = Math.max(1, Math.floor(count));
     if (includeClientOrderId) body.client_order_id = clientOrderId;
     const priceDollars = formatKalshiPriceDollars(priceCents / 100);

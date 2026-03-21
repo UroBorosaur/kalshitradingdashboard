@@ -53,9 +53,12 @@ const sliderControls: Array<{
     | "liquidityMultiplier"
     | "highProbModelMin"
     | "highProbMarketMin"
+    | "bitcoinMicroLongshotMarketMax"
+    | "bitcoinMicroLongshotMinGap"
     | "replacementMinDelta"
     | "cancelReplaceMinImprovement"
     | "watchlistPromotionThreshold"
+    | "strategyPerformanceMaxBoost"
   >;
   label: string;
   min: number;
@@ -133,6 +136,28 @@ const sliderControls: Array<{
     format: (value) => `${(value * 100).toFixed(0)}%`,
   },
   {
+    key: "bitcoinMicroLongshotMarketMax",
+    label: "BTC Longshot Market Max",
+    min: 0.12,
+    max: 0.6,
+    step: 0.01,
+    description: "Maximum selected-side implied probability allowed into the BTC micro longshot lane.",
+    effectLow: "Lower = only deeper longshots qualify.",
+    effectHigh: "Higher = more mid-probability BTC trades can enter the longshot lane.",
+    format: (value) => `${(value * 100).toFixed(0)}%`,
+  },
+  {
+    key: "bitcoinMicroLongshotMinGap",
+    label: "BTC Longshot Gap Min",
+    min: 0.005,
+    max: 0.12,
+    step: 0.005,
+    description: "Minimum model minus implied selected-side probability gap required for BTC micro longshots.",
+    effectLow: "Lower = more BTC longshot candidates survive.",
+    effectHigh: "Higher = only clearer BTC micro dislocations survive.",
+    format: (value) => `${(value * 100).toFixed(1)} pts`,
+  },
+  {
     key: "replacementMinDelta",
     label: "Replacement Margin",
     min: 0.005,
@@ -165,6 +190,17 @@ const sliderControls: Array<{
     effectHigh: "Higher = watchlist names need clearer improvement before promotion.",
     format: (value) => value.toFixed(3),
   },
+  {
+    key: "strategyPerformanceMaxBoost",
+    label: "Strategy Bias Cap",
+    min: 0,
+    max: 0.006,
+    step: 0.0005,
+    description: "Caps the score boost from recently profitable strategy tags and categories.",
+    effectLow: "Lower = recent winners influence ranking less.",
+    effectHigh: "Higher = selector leans harder into proven strategy lanes.",
+    format: (value) => value.toFixed(4),
+  },
 ];
 
 const toggleControls: Array<{
@@ -172,6 +208,7 @@ const toggleControls: Array<{
     AutomationControls,
     | "highProbabilityEnabled"
     | "favoriteLongshotEnabled"
+    | "bitcoinMicroLongshotEnabled"
     | "throughputRecoveryEnabled"
     | "exploratoryFallbackEnabled"
     | "replacementEnabled"
@@ -179,6 +216,7 @@ const toggleControls: Array<{
     | "watchlistPromotionEnabled"
     | "adaptiveLearningEnabled"
     | "liquidationAdvisoryEnabled"
+    | "strategyPerformanceEnabled"
   >;
   label: string;
   description: string;
@@ -198,6 +236,13 @@ const toggleControls: Array<{
     description: "Uses the favorite-longshot bias override and fade logic.",
     onText: "On = favorite auto-exec and cheap-longshot fade are active.",
     offText: "Off = no favorite-bias override or fade.",
+  },
+  {
+    key: "bitcoinMicroLongshotEnabled",
+    label: "BTC Micro Longshots",
+    description: "Allows a separate low-implied-probability BTC micro lane when the model-implied gap is strong enough.",
+    onText: "On = <=60m BTC longshots can bypass the global high-prob gate under tighter spread/toxicity rules.",
+    offText: "Off = BTC still runs only through high-probability and favorite-bias paths.",
   },
   {
     key: "throughputRecoveryEnabled",
@@ -247,6 +292,13 @@ const toggleControls: Array<{
     description: "Evaluates held positions near resolution and emits hold/trim/flatten recommendations.",
     onText: "On = liquidation recommendations are generated and stored.",
     offText: "Off = no liquidation advisory pass.",
+  },
+  {
+    key: "strategyPerformanceEnabled",
+    label: "Recent Winner Bias",
+    description: "Biases ranking and sizing toward strategies that have recently shown better realized execution and markout performance.",
+    onText: "On = selector leans into recently profitable strategy tags and BTC micro longshots.",
+    offText: "Off = selector ignores recent realized strategy performance.",
   },
 ];
 
@@ -573,6 +625,7 @@ export function PredictionAutomationPanel() {
                       <span>Transform: {candidate.probabilityTransform ?? "n/a"}</span>
                       <span>Calib: {candidate.calibrationMethod ?? "n/a"}</span>
                       <span>Score: {candidate.compositeScore?.toFixed(4) ?? "n/a"}</span>
+                      <span>Winner Bias: {formatNumber(candidate.strategyPerformanceBoost, 4)}</span>
                       <span>Net Alpha: {candidate.netAlphaUsd !== undefined ? `$${candidate.netAlphaUsd.toFixed(2)}` : "n/a"}</span>
                       <span>Port Wt: {candidate.portfolioWeight !== undefined ? `${(candidate.portfolioWeight * 100).toFixed(1)}%` : "n/a"}</span>
                       <span>Contracts: {candidate.recommendedContracts}</span>
@@ -602,8 +655,14 @@ export function PredictionAutomationPanel() {
                       {candidate.executionStatus}: {candidate.executionMessage}
                     </p>
 
-                    {candidate.incumbentComparison || candidate.watchlistState || candidate.silentClock || candidate.leadLag || candidate.liquidationRecommendation || candidate.orderMaintenance ? (
+                    {candidate.incumbentComparison || candidate.watchlistState || candidate.btcMicroLongshot || candidate.silentClock || candidate.leadLag || candidate.liquidationRecommendation || candidate.orderMaintenance || (candidate.strategyPerformanceBoost ?? 0) !== 0 ? (
                       <div className="mt-2 space-y-1 text-[11px] text-slate-400">
+                        {(candidate.strategyPerformanceBoost ?? 0) !== 0 ? (
+                          <p>
+                            Recent winner bias: {formatNumber(candidate.strategyPerformanceBoost, 4)} |{" "}
+                            {candidate.strategyPerformanceReasons?.slice(0, 2).join(" | ")}
+                          </p>
+                        ) : null}
                         {candidate.incumbentComparison ? (
                           <p>
                             Replacement: {candidate.incumbentComparison.action} | delta {formatNumber(candidate.incumbentComparison.replacementScoreDelta, 4)} |{" "}
@@ -614,6 +673,13 @@ export function PredictionAutomationPanel() {
                           <p>
                             Watchlist: {candidate.watchlistState.status} | age {formatNumber(candidate.watchlistState.ageHours, 1)}h | cycles{" "}
                             {candidate.watchlistState.cyclesObserved} | promo {formatNumber(candidate.watchlistState.promotionScore, 4)}
+                          </p>
+                        ) : null}
+                        {candidate.btcMicroLongshot ? (
+                          <p>
+                            BTC micro longshot: gap {formatPercent(candidate.btcMicroLongshot.probabilityGap)} | implied max{" "}
+                            {formatPercent(candidate.btcMicroLongshot.marketProbabilityCeiling)} | tox max{" "}
+                            {formatPercent(candidate.btcMicroLongshot.maxToxicity)} | cap {formatUsd(candidate.btcMicroLongshot.stakeCapUsd)}
                           </p>
                         ) : null}
                         {candidate.silentClock ? (
@@ -895,9 +961,55 @@ export function PredictionAutomationPanel() {
                         {formatNumber(attribution.overlays?.leadLagPerformance.avgScoreContribution, 4)}
                       </p>
                     </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">BTC Micro Longshots</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Decisions {attribution.strategyLanes?.bitcoinMicroLongshot.decisions ?? 0} | Placed{" "}
+                        {attribution.strategyLanes?.bitcoinMicroLongshot.placed ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Gap {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgProbabilityGap)} | Implied{" "}
+                        {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgMarketProb)}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Exec {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgExecutionAdjustedEdge)} | 30s{" "}
+                        {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgMarkout30s)} | Expiry{" "}
+                        {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgMarkoutExpiry)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Recent Winner Bias</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Trades {attribution.strategyPerformance?.totalPlacedTrades ?? 0} | Positive tags{" "}
+                        {attribution.strategyPerformance?.topTags.filter((slice) => slice.recommendedBoost > 0).length ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        {attribution.strategyPerformance?.topTags
+                          ?.filter((slice) => slice.recommendedBoost > 0)
+                          .slice(0, 3)
+                          .map((slice) => `${slice.key} ${slice.recommendedBoost.toFixed(4)}`)
+                          .join(" | ") || "No strategy-performance leaders yet."}
+                      </p>
+                    </div>
                   </div>
 
                   <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Top Strategy Tags</p>
+                      {attribution.strategyPerformance?.topTags?.length ? (
+                        attribution.strategyPerformance.topTags.slice(0, 6).map((slice, index) => (
+                          <p key={uniqueRowKey(["strategy", slice.key], index)} className="mt-1 text-[11px] text-slate-300">
+                            {slice.key} | boost {formatNumber(slice.recommendedBoost, 4)} | trades {slice.trades} | exec{" "}
+                            {formatPercent(slice.avgExecutionAdjustedEdge)} | 30s {formatPercent(slice.avgMarkout30s)} | expiry{" "}
+                            {formatPercent(slice.avgMarkoutExpiry)}
+                          </p>
+                        ))
+                      ) : (
+                        <p className="mt-1 text-[11px] text-slate-500">No strategy-performance sample yet.</p>
+                      )}
+                    </div>
                     {[
                       { label: "By Expert", rows: attribution.byExpert },
                       { label: "By Health Regime", rows: attribution.byExecutionHealth },
@@ -932,7 +1044,7 @@ export function PredictionAutomationPanel() {
                           {formatPercent(trade.markout30s)} | expiry {formatPercent(trade.markoutExpiry)} | tox {formatPercent(trade.toxicityScore)} |{" "}
                           uncert {formatPercent(trade.uncertaintyWidth)} | inv {formatNumber(trade.inventorySkew)} | silent{" "}
                           {formatPercent(trade.silentClockProbabilityContribution)} | lag {formatPercent(trade.leadLagProbabilityContribution)} | cluster{" "}
-                          {trade.clusterStress ? "stressed" : "normal"} | cash {formatUsd(
+                          {trade.clusterStress ? "stressed" : "normal"} | longshot {formatPercent(trade.btcMicroLongshotProbabilityGap)} | cash {formatUsd(
                             trade.actualCashDeltaUsd,
                           )} | drift {formatUsd(trade.cashDeltaDriftUsd)} | fee {formatUsd(trade.inferredActualFeeUsd)}
                         </p>
