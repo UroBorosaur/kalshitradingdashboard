@@ -42,20 +42,28 @@ function gateLabel(gate: CandidateGateKey) {
 }
 
 export function buildFalseNegativeLearning(args: {
-  attribution: ExecutionAttributionSummary;
+  selectionControl: ExecutionAttributionSummary["selectionControl"];
   lookbackHours: number;
   active: boolean;
 }): FalseNegativeLearningOutput {
   const recommendations: GateLearningRecommendation[] = [];
-  const control = args.attribution.selectionControl;
+  const control = args.selectionControl;
   const resolvedCount = control?.resolvedNearMisses.count ?? 0;
+  let gatesEvaluated = 0;
+  let gatesMeetingMinSample = 0;
+  let gatesBlockedBySupport = 0;
 
   for (const gate of control?.byGate ?? []) {
     const key = gate.gate;
     if (key === "POSITION_ORDER_CONFLICT" || key === "ORDER_GROUP_BRAKE" || key === "CLUSTER_CAP") continue;
+    gatesEvaluated += 1;
     const sampleCount = gate.count;
     const required = MIN_SAMPLE_BY_GATE[key] ?? 5;
-    if (sampleCount < required || resolvedCount <= 0) continue;
+    if (sampleCount < required || resolvedCount <= 0) {
+      gatesBlockedBySupport += 1;
+      continue;
+    }
+    gatesMeetingMinSample += 1;
 
     const hitRate = control?.resolvedNearMisses.hitRate ?? null;
     const profitableRate = control?.resolvedNearMisses.profitableRate ?? null;
@@ -93,6 +101,10 @@ export function buildFalseNegativeLearning(args: {
     generatedAt: new Date().toISOString(),
     lookbackHours: args.lookbackHours,
     active: args.active,
+    resolvedNearMissCount: resolvedCount,
+    gatesEvaluated,
+    gatesMeetingMinSample,
+    gatesBlockedBySupport,
     recommendations,
   };
 }

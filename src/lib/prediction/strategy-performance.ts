@@ -13,6 +13,7 @@ const TAG_MIN_TRADES = 2;
 const CATEGORY_MIN_TRADES = 2;
 const BTC_MICRO_LONGSHOT_FOCUS_MULTIPLIER = 1.35;
 const BTC_MICRO_BRIDGE_MULTIPLIER = 1.15;
+const SPORTS_UNDERDOG_FOCUS_MULTIPLIER = 1.2;
 
 interface StrategyBucketAccumulator {
   trades: number;
@@ -124,10 +125,11 @@ function scoreBucket(args: {
 
 export function buildStrategyPerformanceProfile(args: {
   attribution: ExecutionAttributionSummary | null;
+  trades?: ExecutionAttributionTrade[];
   lookbackHours: number;
   maxBoost: number;
 }): StrategyPerformanceProfile | null {
-  const trades = args.attribution?.recentTrades ?? [];
+  const trades = args.trades ?? args.attribution?.recentTrades ?? [];
   const placedTrades = trades.filter((trade) => trade.executionStatus === "PLACED");
   if (!placedTrades.length) return null;
 
@@ -248,6 +250,17 @@ export function evaluateStrategyPerformanceAdjustment(args: {
       const boosted = bridgeBoost * BTC_MICRO_BRIDGE_MULTIPLIER;
       scoreBoost += boosted;
       reasons.push(`BTC physical-bridge boost ${boosted.toFixed(4)} from recent bridge trades.`);
+    }
+  }
+  if (
+    candidate.category === "SPORTS" &&
+    candidate.strategyTags?.includes("SPORTS_UNDERDOG_ASYMMETRY")
+  ) {
+    const laneBoost = profile.topTags.find((slice) => slice.key === "SPORTS_UNDERDOG_ASYMMETRY")?.recommendedBoost ?? 0;
+    if (laneBoost > 0) {
+      const boosted = laneBoost * SPORTS_UNDERDOG_FOCUS_MULTIPLIER;
+      scoreBoost += boosted;
+      reasons.push(`Sports underdog asymmetry boost ${boosted.toFixed(4)} from recent low-cost winner trades.`);
     }
   }
 

@@ -163,6 +163,7 @@ function inferCategory(raw: Record<string, unknown>): PredictionCategory {
   const haystack = [raw.title, raw.subtitle, raw.event_ticker, raw.series_ticker, raw.ticker]
     .map((value) => String(value ?? "").toLowerCase())
     .join(" ");
+  const ticker = String(raw.ticker ?? raw.event_ticker ?? "").toLowerCase();
 
   if (/(bitcoin|btc|ethereum|eth|crypto)/.test(haystack)) return "BITCOIN";
   if (/(weather|temperature|rain|snow|storm|hurricane|wind|precip|freez|heat)/.test(haystack)) return "WEATHER";
@@ -172,6 +173,12 @@ function inferCategory(raw: Record<string, unknown>): PredictionCategory {
   }
   if (/(stock|equity|nasdaq|s&p|dow|earnings|guidance|aapl|msft|nvda|tsla|qqq|spy)/.test(haystack)) return "STOCKS";
   if (/(fed|cpi|inflation|gdp|unemployment|rate cut|fomc|treasury|yield|macro)/.test(haystack)) return "MACRO";
+  if (
+    (/\bwinner\?/.test(haystack) && (/\bat\b/.test(haystack) || /\bvs\b/.test(haystack))) ||
+    /kx(?:nba|wnba|ncaa|atp|wta|nfl|mlb|nhl|soccer|epl|baller)/.test(ticker)
+  ) {
+    return "SPORTS";
+  }
   if (/(nba|nfl|mlb|nhl|ncaa|soccer|football|basketball|baseball|tennis|golf|match|vs\b|game)/.test(haystack)) {
     return "SPORTS";
   }
@@ -325,7 +332,13 @@ async function kalshiRequestWithBase<T>(
   if (!response.ok) {
     const text = await response.text();
     const normalized = text.toLowerCase();
-    if (response.status === 404 && (normalized.includes("market_not_found") || normalized.includes("market not found"))) {
+    if (
+      response.status === 404 &&
+      (normalized.includes("market_not_found") ||
+        normalized.includes("market not found") ||
+        normalized.includes("\"code\":\"not_found\"") ||
+        normalized.includes('"code":"not_found"'))
+    ) {
       throw new Error(`Kalshi market not found in this environment (${response.status}): ${text}`);
     }
     throw new Error(`Kalshi request failed (${response.status}): ${text}`);

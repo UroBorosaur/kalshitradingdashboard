@@ -23,6 +23,7 @@ const allCategories: PredictionCategory[] = [
 const baseCategories: PredictionCategory[] = [...allCategories];
 const AUTOMATION_CONTROLS_STORAGE_KEY = "prediction-automation-controls";
 const AUTOMATION_ATTRIBUTION_LOOKBACK_HOURS = 72;
+type AttributionScope = "RUN" | "LOOKBACK";
 const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   edgeMultiplier: 1,
   confidenceShift: 0,
@@ -35,6 +36,9 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   bitcoinMicroLongshotEnabled: true,
   bitcoinMicroLongshotMarketMax: 0.38,
   bitcoinMicroLongshotMinGap: 0.035,
+  sportsUnderdogLongshotEnabled: true,
+  sportsUnderdogLongshotMarketMax: 0.45,
+  sportsUnderdogLongshotMinGap: 0.075,
   throughputRecoveryEnabled: true,
   exploratoryFallbackEnabled: true,
   replacementEnabled: true,
@@ -66,18 +70,25 @@ export function usePredictionAutomation() {
 
   const [summary, setSummary] = useState<AutomationRunSummary | null>(null);
   const [attribution, setAttribution] = useState<ExecutionAttributionSummary | null>(null);
+  const [attributionScope, setAttributionScope] = useState<AttributionScope>("LOOKBACK");
   const [loading, setLoading] = useState(false);
   const [attributionLoading, setAttributionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attributionError, setAttributionError] = useState<string | null>(null);
 
-  const fetchAttribution = useCallback(async () => {
+  const fetchAttribution = useCallback(async (options?: { runId?: string | null; scope?: AttributionScope }) => {
     setAttributionLoading(true);
     setAttributionError(null);
     try {
-      const response = await fetch(
-        `/api/automation/attribution?hours=${AUTOMATION_ATTRIBUTION_LOOKBACK_HOURS}&recentTradeLimit=12&bucketLimit=6`,
-      );
+      const scope = options?.scope ?? attributionScope;
+      const runId = scope === "RUN" ? (options?.runId ?? summary?.runId ?? null) : null;
+      const params = new URLSearchParams({
+        hours: String(AUTOMATION_ATTRIBUTION_LOOKBACK_HOURS),
+        recentTradeLimit: "12",
+        bucketLimit: "6",
+      });
+      if (runId) params.set("runId", runId);
+      const response = await fetch(`/api/automation/attribution?${params.toString()}`);
       const json = (await response.json()) as {
         ok: boolean;
         attribution?: ExecutionAttributionSummary;
@@ -94,7 +105,7 @@ export function usePredictionAutomation() {
     } finally {
       setAttributionLoading(false);
     }
-  }, []);
+  }, [attributionScope, summary?.runId]);
 
   const runCycle = useCallback(
     async (override?: Partial<{ execute: boolean; mode: AutomationMode; categories: PredictionCategory[] }>) => {
@@ -126,7 +137,8 @@ export function usePredictionAutomation() {
         }
 
         setSummary(json.summary);
-        await fetchAttribution();
+        setAttributionScope("RUN");
+        await fetchAttribution({ runId: json.summary.runId, scope: "RUN" });
       } catch (err) {
         setError((err as Error).message);
       } finally {
@@ -217,6 +229,8 @@ export function usePredictionAutomation() {
     setCadenceMinutes,
     summary,
     attribution,
+    attributionScope,
+    setAttributionScope,
     loading,
     attributionLoading,
     error,

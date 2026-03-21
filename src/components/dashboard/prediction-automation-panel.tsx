@@ -55,6 +55,8 @@ const sliderControls: Array<{
     | "highProbMarketMin"
     | "bitcoinMicroLongshotMarketMax"
     | "bitcoinMicroLongshotMinGap"
+    | "sportsUnderdogLongshotMarketMax"
+    | "sportsUnderdogLongshotMinGap"
     | "replacementMinDelta"
     | "cancelReplaceMinImprovement"
     | "watchlistPromotionThreshold"
@@ -158,6 +160,28 @@ const sliderControls: Array<{
     format: (value) => `${(value * 100).toFixed(1)} pts`,
   },
   {
+    key: "sportsUnderdogLongshotMarketMax",
+    label: "Sports Longshot Market Max",
+    min: 0.18,
+    max: 0.6,
+    step: 0.01,
+    description: "Maximum selected-side implied probability allowed into the sports underdog asymmetry lane.",
+    effectLow: "Lower = only cheaper sports underdogs qualify.",
+    effectHigh: "Higher = more mid-priced sports underdogs can enter the lane.",
+    format: (value) => `${(value * 100).toFixed(0)}%`,
+  },
+  {
+    key: "sportsUnderdogLongshotMinGap",
+    label: "Sports Longshot Gap Min",
+    min: 0.02,
+    max: 0.18,
+    step: 0.005,
+    description: "Minimum model minus implied selected-side probability gap required for low-cost sports winner trades.",
+    effectLow: "Lower = more sports underdog candidates survive.",
+    effectHigh: "Higher = only stronger sports underdog dislocations survive.",
+    format: (value) => `${(value * 100).toFixed(1)} pts`,
+  },
+  {
     key: "replacementMinDelta",
     label: "Replacement Margin",
     min: 0.005,
@@ -209,6 +233,7 @@ const toggleControls: Array<{
     | "highProbabilityEnabled"
     | "favoriteLongshotEnabled"
     | "bitcoinMicroLongshotEnabled"
+    | "sportsUnderdogLongshotEnabled"
     | "throughputRecoveryEnabled"
     | "exploratoryFallbackEnabled"
     | "replacementEnabled"
@@ -243,6 +268,13 @@ const toggleControls: Array<{
     description: "Allows a separate low-implied-probability BTC micro lane when the model-implied gap is strong enough.",
     onText: "On = <=60m BTC longshots can bypass the global high-prob gate under tighter spread/toxicity rules.",
     offText: "Off = BTC still runs only through high-probability and favorite-bias paths.",
+  },
+  {
+    key: "sportsUnderdogLongshotEnabled",
+    label: "Sports Longshots",
+    description: "Allows a separate low-cost sports winner lane when the model-implied gap is strong and the opposite market confirms the asymmetry.",
+    onText: "On = sports underdogs can bypass the global high-prob gate under tighter spread/liquidity rules.",
+    offText: "Off = sports underdogs still run only through the regular paths.",
   },
   {
     key: "throughputRecoveryEnabled",
@@ -352,11 +384,14 @@ export function PredictionAutomationPanel() {
     setCadenceMinutes,
     summary,
     attribution,
+    attributionScope,
+    setAttributionScope,
     loading,
     attributionLoading,
     error,
     attributionError,
     runCycle,
+    fetchAttribution,
   } = usePredictionAutomation();
 
   return (
@@ -655,7 +690,7 @@ export function PredictionAutomationPanel() {
                       {candidate.executionStatus}: {candidate.executionMessage}
                     </p>
 
-                    {candidate.incumbentComparison || candidate.watchlistState || candidate.btcMicroLongshot || candidate.silentClock || candidate.leadLag || candidate.liquidationRecommendation || candidate.orderMaintenance || (candidate.strategyPerformanceBoost ?? 0) !== 0 ? (
+                    {candidate.incumbentComparison || candidate.watchlistState || candidate.btcMicroLongshot || candidate.sportsUnderdogLongshot || candidate.silentClock || candidate.leadLag || candidate.liquidationRecommendation || candidate.orderMaintenance || (candidate.strategyPerformanceBoost ?? 0) !== 0 ? (
                       <div className="mt-2 space-y-1 text-[11px] text-slate-400">
                         {(candidate.strategyPerformanceBoost ?? 0) !== 0 ? (
                           <p>
@@ -680,6 +715,15 @@ export function PredictionAutomationPanel() {
                             BTC micro longshot: gap {formatPercent(candidate.btcMicroLongshot.probabilityGap)} | implied max{" "}
                             {formatPercent(candidate.btcMicroLongshot.marketProbabilityCeiling)} | tox max{" "}
                             {formatPercent(candidate.btcMicroLongshot.maxToxicity)} | cap {formatUsd(candidate.btcMicroLongshot.stakeCapUsd)}
+                          </p>
+                        ) : null}
+                        {candidate.sportsUnderdogLongshot ? (
+                          <p>
+                            Sports underdog longshot: gap {formatPercent(candidate.sportsUnderdogLongshot.probabilityGap)} | implied max{" "}
+                            {formatPercent(candidate.sportsUnderdogLongshot.marketProbabilityCeiling)} | counterpart{" "}
+                            {candidate.sportsUnderdogLongshot.counterpartTicker ?? "n/a"} | advantage{" "}
+                            {formatPercent(candidate.sportsUnderdogLongshot.equivalentPriceAdvantage)} | cap{" "}
+                            {formatUsd(candidate.sportsUnderdogLongshot.stakeCapUsd)}
                           </p>
                         ) : null}
                         {candidate.silentClock ? (
@@ -844,6 +888,28 @@ export function PredictionAutomationPanel() {
                 <Brain className="h-3.5 w-3.5" />
                 Execution Attribution
               </p>
+              <div className="mb-2 flex gap-2">
+                {[
+                  { key: "RUN" as const, label: "Last Run" },
+                  { key: "LOOKBACK" as const, label: "72h" },
+                ].map((option) => (
+                  <button
+                    key={option.key}
+                    onClick={() => {
+                      setAttributionScope(option.key);
+                      void fetchAttribution({ scope: option.key });
+                    }}
+                    className={cn(
+                      "rounded-md border px-2 py-1 text-[11px] transition-all",
+                      attributionScope === option.key
+                        ? "border-sky-500/50 bg-sky-500/10 text-sky-100"
+                        : "border-slate-800 bg-slate-950/60 text-slate-400",
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
 
               {attributionError ? (
                 <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-red-300">{attributionError}</div>
@@ -854,6 +920,9 @@ export function PredictionAutomationPanel() {
                 </div>
               ) : attribution ? (
                 <div className="space-y-3">
+                  <p className="text-[11px] text-slate-500">
+                    Scope {attribution.filteredRunId ? `run ${attribution.filteredRunId.slice(0, 8)}` : "last 72h"}.
+                  </p>
                   <div className="grid gap-2 text-[11px] text-slate-300 md:grid-cols-6">
                     <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
                       <p className="text-slate-500">Decisions / Placed</p>
@@ -933,7 +1002,9 @@ export function PredictionAutomationPanel() {
                         {attribution.learning?.recommendations.length ?? 0}
                       </p>
                       <p className="text-[11px] text-slate-300">
-                        Lookback {attribution.learning?.lookbackHours ?? 0}h
+                        Lookback {attribution.learning?.lookbackHours ?? 0}h | Resolved near misses{" "}
+                        {attribution.learning?.resolvedNearMissCount ?? 0} | Supported gates{" "}
+                        {attribution.learning?.gatesMeetingMinSample ?? 0}/{attribution.learning?.gatesEvaluated ?? 0}
                       </p>
                     </div>
 
@@ -976,6 +1047,23 @@ export function PredictionAutomationPanel() {
                         Exec {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgExecutionAdjustedEdge)} | 30s{" "}
                         {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgMarkout30s)} | Expiry{" "}
                         {formatPercent(attribution.strategyLanes?.bitcoinMicroLongshot.avgMarkoutExpiry)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                      <p className="text-[11px] text-slate-400">Sports Underdog Longshots</p>
+                      <p className="mt-1 text-[11px] text-slate-300">
+                        Decisions {attribution.strategyLanes?.sportsUnderdogLongshot.decisions ?? 0} | Placed{" "}
+                        {attribution.strategyLanes?.sportsUnderdogLongshot.placed ?? 0}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Gap {formatPercent(attribution.strategyLanes?.sportsUnderdogLongshot.avgProbabilityGap)} | Implied{" "}
+                        {formatPercent(attribution.strategyLanes?.sportsUnderdogLongshot.avgMarketProb)}
+                      </p>
+                      <p className="text-[11px] text-slate-300">
+                        Exec {formatPercent(attribution.strategyLanes?.sportsUnderdogLongshot.avgExecutionAdjustedEdge)} | 30s{" "}
+                        {formatPercent(attribution.strategyLanes?.sportsUnderdogLongshot.avgMarkout30s)} | Expiry{" "}
+                        {formatPercent(attribution.strategyLanes?.sportsUnderdogLongshot.avgMarkoutExpiry)}
                       </p>
                     </div>
 
@@ -1273,7 +1361,11 @@ export function PredictionAutomationPanel() {
                       </p>
                     ))
                   ) : (
-                    <p className="text-[11px] text-slate-500">No bounded false-negative learning recommendations yet.</p>
+                    <p className="text-[11px] text-slate-500">
+                      No bounded false-negative learning recommendations yet. Resolved near misses:{" "}
+                      {attribution.learning?.resolvedNearMissCount ?? 0}. Gates meeting minimum support:{" "}
+                      {attribution.learning?.gatesMeetingMinSample ?? 0}/{attribution.learning?.gatesEvaluated ?? 0}.
+                    </p>
                   )}
                 </div>
 

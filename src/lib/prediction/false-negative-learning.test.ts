@@ -56,7 +56,7 @@ const attribution = {
 
 test("false-negative learning emits bounded recommendation and skips structural hard guards", () => {
   const output = buildFalseNegativeLearning({
-    attribution,
+    selectionControl: attribution.selectionControl,
     lookbackHours: 72,
     active: false,
   });
@@ -65,4 +65,7 @@ test("false-negative learning emits bounded recommendation and skips structural 
   assert.equal(output.recommendations[0]?.gate, "CONFIDENCE_FLOOR");
   assert.ok((output.recommendations[0]?.boundedDelta ?? 0) <= 0.01);
   assert.equal(output.recommendations[0]?.active, false);
+  assert.equal(output.resolvedNearMissCount, 8);
+  assert.equal(output.gatesEvaluated, 1);
+  assert.equal(output.gatesMeetingMinSample, 1);
 });

@@ -673,7 +673,7 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(firstTrade.inferredActualFeeUsd, 0.02);
 
   assert.equal(summary.selectionControl?.executed.count, 1);
-  assert.equal(summary.selectionControl?.nearMisses.count, 4);
+  assert.equal(summary.selectionControl?.nearMisses.count, 3);
   const missRow = summary.selectionControl?.recentNearMisses.find((row) => row.ticker === "MISS");
   assert.equal(missRow?.latestQuoteDrift, 0.05);
   assert.equal(missRow?.resolved, true);
@@ -707,5 +707,133 @@ test("summarizeExecutionAttribution groups executed candidates by expert, regime
   assert.equal(summary.strategyLanes?.bitcoinMicroLongshot.decisions, 1);
   assert.equal(summary.strategyLanes?.bitcoinMicroLongshot.placed, 1);
   assert.equal(summary.strategyLanes?.bitcoinMicroLongshot.avgProbabilityGap, 0.06);
+  assert.equal(summary.strategyLanes?.sportsUnderdogLongshot.decisions, 0);
   assert.equal(summary.strategyPerformance?.totalPlacedTrades, 1);
+});
+
+test("summarizeExecutionAttribution excludes executed-candidate failures from near misses and can filter by run id", () => {
+  const decisions = [
+    envelope<StoredCandidateDecisionEvent>(
+      "candidate_decisions",
+      "automation/executed-candidates",
+      "decision:run-a:FAIL:YES",
+      {
+        runId: "run-a",
+        mode: "AI",
+        executeRequested: true,
+        ticker: "FAIL",
+        title: "Failed Placement",
+        category: "BITCOIN",
+        side: "YES",
+        verdict: "BUY_YES",
+        marketProb: 0.21,
+        modelProb: 0.34,
+        edge: 0.12,
+        executionAdjustedEdge: 0.1,
+        confidence: 0.8,
+        recommendedStakeUsd: 2,
+        recommendedContracts: 2,
+        limitPriceCents: 21,
+        probabilityTransform: "SIGMOID",
+        calibrationMethod: "TEMPERATURE",
+        compositeScore: 0.02,
+        executionStatus: "FAILED",
+        executionMessage: "Kalshi request failed (404): market_not_found",
+        rationale: [],
+      },
+    ),
+    envelope<StoredCandidateDecisionEvent>(
+      "candidate_decisions",
+      "automation/planned-candidates",
+      "decision:run-a:MISS:YES",
+      {
+        runId: "run-a",
+        mode: "AI",
+        executeRequested: true,
+        ticker: "MISS",
+        title: "Real Near Miss",
+        category: "SPORTS",
+        side: "YES",
+        verdict: "WATCHLIST",
+        marketProb: 0.44,
+        modelProb: 0.51,
+        edge: 0.03,
+        executionAdjustedEdge: 0.02,
+        confidence: 0.55,
+        recommendedStakeUsd: 1.5,
+        recommendedContracts: 1,
+        limitPriceCents: 44,
+        probabilityTransform: "SIGMOID",
+        calibrationMethod: "TEMPERATURE",
+        compositeScore: 0.01,
+        gateDiagnostics: [
+          {
+            gate: "CONFIDENCE_FLOOR",
+            passed: false,
+            observed: 0.54,
+            threshold: 0.55,
+            missBy: 0.01,
+            unit: "probability",
+            detail: "Confidence just below threshold.",
+          },
+        ],
+        executionStatus: "SKIPPED",
+        executionMessage: "Non-actionable verdict (WATCHLIST): analysis only.",
+        rationale: [],
+      },
+    ),
+    envelope<StoredCandidateDecisionEvent>(
+      "candidate_decisions",
+      "automation/planned-candidates",
+      "decision:run-b:OTHER:YES",
+      {
+        runId: "run-b",
+        mode: "AI",
+        executeRequested: true,
+        ticker: "OTHER",
+        title: "Other Run",
+        category: "SPORTS",
+        side: "YES",
+        verdict: "WATCHLIST",
+        marketProb: 0.4,
+        modelProb: 0.47,
+        edge: 0.02,
+        executionAdjustedEdge: 0.015,
+        confidence: 0.51,
+        recommendedStakeUsd: 1.2,
+        recommendedContracts: 1,
+        limitPriceCents: 40,
+        probabilityTransform: "SIGMOID",
+        calibrationMethod: "TEMPERATURE",
+        compositeScore: 0.008,
+        executionStatus: "SKIPPED",
+        executionMessage: "Non-actionable verdict (WATCHLIST): analysis only.",
+        rationale: [],
+      },
+    ),
+  ];
+
+  const summary = summarizeExecutionAttribution({
+    lookbackHours: 72,
+    runId: "run-a",
+    decisions,
+    orders: [],
+    fills: [],
+    balances: [],
+    quotes: [],
+    replacements: [],
+    orderActions: [],
+    watchlistEvents: [],
+    learningOutputs: [],
+    liquidationDecisions: [],
+    signalOverlays: [],
+    resolutions: [],
+    markouts: [],
+  });
+
+  assert.equal(summary.filteredRunId, "run-a");
+  assert.equal(summary.recentTrades.length, 1);
+  assert.equal(summary.recentTrades[0]?.ticker, "FAIL");
+  assert.equal(summary.selectionControl?.nearMisses.count, 1);
+  assert.equal(summary.selectionControl?.recentNearMisses[0]?.ticker, "MISS");
 });

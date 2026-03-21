@@ -1345,7 +1345,17 @@ const streamService = new KalshiStreamService();
 
 export async function getKalshiOpenMarketsStream(categories: PredictionCategory[], limit = 150) {
   try {
-    return await streamService.primePublic(categories, limit);
+    const streamRows = await streamService.primePublic(categories, limit);
+    const minExpected = Math.min(Math.max(12, Math.floor(limit / 5)), limit);
+    if (streamRows.length >= minExpected) return streamRows;
+
+    const restRows = await getKalshiOpenMarkets(categories, limit);
+    if (!restRows.length) return streamRows;
+
+    const merged = new Map<string, PredictionMarketQuote>();
+    for (const row of restRows) merged.set(row.ticker, row);
+    for (const row of streamRows) merged.set(row.ticker, row);
+    return [...merged.values()].slice(0, limit);
   } catch {
     return getKalshiOpenMarkets(categories, limit);
   }

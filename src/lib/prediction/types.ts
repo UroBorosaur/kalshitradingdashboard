@@ -21,6 +21,7 @@ export type CandidateGateKey =
   | "BOOTSTRAP_HEALTH";
 export type StrategyTag =
   | "BTC_MICRO_LONGSHOT"
+  | "SPORTS_UNDERDOG_ASYMMETRY"
   | "FAVORITE_LONGSHOT_BIAS"
   | "SETTLEMENT_SPEC_ARBITRAGE"
   | "STRIKE_LADDER_COHERENCE"
@@ -176,6 +177,10 @@ export interface FalseNegativeLearningOutput {
   generatedAt: string;
   lookbackHours: number;
   active: boolean;
+  resolvedNearMissCount: number;
+  gatesEvaluated: number;
+  gatesMeetingMinSample: number;
+  gatesBlockedBySupport: number;
   recommendations: GateLearningRecommendation[];
 }
 
@@ -235,6 +240,27 @@ export interface BitcoinMicroLongshotSetup {
   minLiquidityScore: number;
   maxToxicity: number;
   executionAdjustedEdgeFloor: number;
+  sizeScale: number;
+  stakeCapUsd?: number | null;
+  rationale: string;
+}
+
+export interface SportsUnderdogLongshotSetup {
+  eligible: boolean;
+  focusWindow: boolean;
+  probabilityGap: number;
+  modelProbabilityFloor: number;
+  marketProbabilityCeiling: number;
+  minGap: number;
+  minEdge: number;
+  minConfidence: number;
+  maxSpread: number;
+  minLiquidityScore: number;
+  counterpartTicker?: string;
+  counterpartTitle?: string;
+  counterpartEquivalentProbability?: number | null;
+  equivalentPriceAdvantage?: number | null;
+  confirmationGapMin: number;
   sizeScale: number;
   stakeCapUsd?: number | null;
   rationale: string;
@@ -383,6 +409,7 @@ export interface PredictionCandidate {
   liquidationRecommendation?: LiquidationDecision;
   orderMaintenance?: OrderMaintenanceDecision;
   btcMicroLongshot?: BitcoinMicroLongshotSetup;
+  sportsUnderdogLongshot?: SportsUnderdogLongshotSetup;
   executionPlan?: {
     limitPriceCents: number;
     patienceHours: number;
@@ -581,6 +608,7 @@ export interface SignalOverlayAttributionSummary {
 }
 
 export interface AutomationRunSummary {
+  runId: string;
   mode: AutomationMode;
   executed: boolean;
   simulated: boolean;
@@ -691,6 +719,7 @@ export interface ExecutionAttributionTrade {
   clusterStress?: boolean;
   strategyTags?: StrategyTag[];
   btcMicroLongshotProbabilityGap?: number | null;
+  sportsUnderdogLongshotProbabilityGap?: number | null;
   limitPriceCents: number;
   executionRole?: ExecutionPlanRole;
   fillProbability?: number | null;
@@ -713,6 +742,7 @@ export interface ExecutionAttributionTrade {
 }
 
 export interface ExecutionAttributionSummary {
+  filteredRunId?: string | null;
   generatedAt: string;
   lookbackHours: number;
   totals: {
@@ -745,6 +775,7 @@ export interface ExecutionAttributionSummary {
   overlays?: SignalOverlayAttributionSummary;
   strategyLanes?: {
     bitcoinMicroLongshot: StrategyLanePerformanceSummary;
+    sportsUnderdogLongshot: StrategyLanePerformanceSummary;
   };
   strategyPerformance?: StrategyPerformanceProfile;
   selectionControl?: {
@@ -819,6 +850,9 @@ export interface AutomationControls {
   bitcoinMicroLongshotEnabled: boolean;
   bitcoinMicroLongshotMarketMax: number;
   bitcoinMicroLongshotMinGap: number;
+  sportsUnderdogLongshotEnabled: boolean;
+  sportsUnderdogLongshotMarketMax: number;
+  sportsUnderdogLongshotMinGap: number;
   throughputRecoveryEnabled: boolean;
   exploratoryFallbackEnabled: boolean;
   replacementEnabled: boolean;

@@ -18,6 +18,7 @@ import type {
   ReplacementDecision,
   ShadowBaselineProfile,
   SilentClockContribution,
+  SportsUnderdogLongshotSetup,
   WatchlistEvent,
 } from "@/lib/prediction/types";
 
@@ -203,6 +204,7 @@ export interface StoredCandidateDecisionEvent {
   liquidationRecommendation?: LiquidationDecision;
   orderMaintenance?: OrderMaintenanceDecision;
   btcMicroLongshot?: BitcoinMicroLongshotSetup;
+  sportsUnderdogLongshot?: SportsUnderdogLongshotSetup;
   executionStatus?: "PLACED" | "SKIPPED" | "FAILED";
   executionMessage?: string;
   executionOrderId?: string;
@@ -398,6 +400,7 @@ export function toStoredCandidateDecisionPayload(
     liquidationRecommendation: candidate.liquidationRecommendation,
     orderMaintenance: candidate.orderMaintenance,
     btcMicroLongshot: candidate.btcMicroLongshot,
+    sportsUnderdogLongshot: candidate.sportsUnderdogLongshot,
     executionStatus: candidate.executionStatus,
     executionMessage: candidate.executionMessage,
     executionOrderId: candidate.executionOrderId,

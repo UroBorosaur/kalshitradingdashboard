@@ -1,5 +1,6 @@
 import "@/lib/server-only";
 
+import { buildFalseNegativeLearning } from "@/lib/prediction/false-negative-learning";
 import {
   readStoredBalancesSince,
   readStoredCandidateDecisionsSince,
@@ -50,7 +51,6 @@ const DEFAULT_LOOKBACK_HOURS = 72;
 const DEFAULT_RECENT_TRADE_LIMIT = 12;
 const DEFAULT_BUCKET_LIMIT = 6;
 const NEAR_MISS_SOURCE_PRIORITY = [
-  "automation/executed-candidates",
   "automation/conflict-blocked-candidates",
   "automation/planned-candidates",
   "automation/exploratory-boost",
@@ -63,6 +63,7 @@ type AttributionHorizon = "30s" | "2m" | "expiry";
 
 interface SummarizeExecutionAttributionArgs {
   lookbackHours: number;
+  runId?: string;
   recentTradeLimit?: number;
   bucketLimit?: number;
   decisions: Array<PredictionStorageEnvelope<StoredCandidateDecisionEvent>>;
@@ -232,6 +233,14 @@ function quoteMarkProbability(quote: StoredKalshiQuoteEvent, side: PredictionSid
 function sourcePriority(source: string) {
   const index = NEAR_MISS_SOURCE_PRIORITY.indexOf(source as (typeof NEAR_MISS_SOURCE_PRIORITY)[number]);
   return index === -1 ? NEAR_MISS_SOURCE_PRIORITY.length : index;
+}
+
+function matchesRunId<TPayload extends { runId?: string }>(
+  event: PredictionStorageEnvelope<TPayload>,
+  runId: string | null,
+) {
+  if (!runId) return true;
+  return event.payload.runId === runId;
 }
 
 function gateLabel(gate: string) {
@@ -551,13 +560,17 @@ function createStrategyLaneAccumulator(): StrategyLaneAccumulator {
   };
 }
 
-function applyStrategyLaneSample(accumulator: StrategyLaneAccumulator, trade: ExecutionAttributionTrade) {
+function applyStrategyLaneSample(
+  accumulator: StrategyLaneAccumulator,
+  trade: ExecutionAttributionTrade,
+  probabilityGap: number | null | undefined,
+) {
   accumulator.decisions += 1;
   if (trade.executionStatus === "PLACED") accumulator.placed += 1;
   accumulator.marketProbSum += trade.marketProb;
   accumulator.marketProbCount += 1;
-  if (typeof trade.btcMicroLongshotProbabilityGap === "number" && Number.isFinite(trade.btcMicroLongshotProbabilityGap)) {
-    accumulator.probabilityGapSum += trade.btcMicroLongshotProbabilityGap;
+  if (typeof probabilityGap === "number" && Number.isFinite(probabilityGap)) {
+    accumulator.probabilityGapSum += probabilityGap;
     accumulator.probabilityGapCount += 1;
   }
   accumulator.edgeSum += trade.edge;
@@ -828,6 +841,7 @@ function summarizeOrderExecution(args: {
 
 export function summarizeExecutionAttribution({
   lookbackHours,
+  runId,
   recentTradeLimit = DEFAULT_RECENT_TRADE_LIMIT,
   bucketLimit = DEFAULT_BUCKET_LIMIT,
   decisions,
@@ -844,12 +858,21 @@ export function summarizeExecutionAttribution({
   resolutions,
   markouts,
 }: SummarizeExecutionAttributionArgs): ExecutionAttributionSummary {
+  const filteredRunId = runId?.trim() || null;
   const executedDecisions = decisions
+    .filter((event) => matchesRunId(event, filteredRunId))
     .filter((event) => event.source === EXECUTED_CANDIDATE_SOURCE)
     .sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime());
   const candidateDecisions = decisions
+    .filter((event) => matchesRunId(event, filteredRunId))
     .filter((event) => NEAR_MISS_SOURCE_PRIORITY.includes(event.source as (typeof NEAR_MISS_SOURCE_PRIORITY)[number]))
     .sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime());
+  const filteredReplacements = replacements.filter((event) => matchesRunId(event, filteredRunId));
+  const filteredOrderActions = orderActions.filter((event) => matchesRunId(event, filteredRunId));
+  const filteredWatchlistEvents = watchlistEvents.filter((event) => matchesRunId(event, filteredRunId));
+  const filteredLearningOutputs = learningOutputs.filter((event) => matchesRunId(event, filteredRunId));
+  const filteredLiquidationDecisions = liquidationDecisions.filter((event) => matchesRunId(event, filteredRunId));
+  const filteredSignalOverlays = signalOverlays.filter((event) => matchesRunId(event, filteredRunId));
 
   const ordersByClientOrderId = new Map<string, StoredKalshiOrderEvent>();
   const ordersById = new Map<string, StoredKalshiOrderEvent>();
@@ -935,6 +958,7 @@ export function summarizeExecutionAttribution({
   const silentClockOverlay = createOverlayAccumulator();
   const leadLagOverlay = createOverlayAccumulator();
   const bitcoinMicroLongshotLane = createStrategyLaneAccumulator();
+  const sportsUnderdogLongshotLane = createStrategyLaneAccumulator();
   const falseNegativesByExpert = new Map<string, CounterfactualAccumulator>();
   const falseNegativesByCluster = new Map<string, CounterfactualAccumulator>();
   const falseNegativesByToxicity = new Map<string, CounterfactualAccumulator>();
@@ -1005,6 +1029,7 @@ export function summarizeExecutionAttribution({
       clusterStress,
       strategyTags: (decision.strategyTags ?? []) as NonNullable<ExecutionAttributionTrade["strategyTags"]>,
       btcMicroLongshotProbabilityGap: roundNullable(decision.btcMicroLongshot?.probabilityGap, 6),
+      sportsUnderdogLongshotProbabilityGap: roundNullable(decision.sportsUnderdogLongshot?.probabilityGap, 6),
       limitPriceCents: decision.limitPriceCents,
       executionRole: decision.executionPlan?.role,
       fillProbability: roundNullable(decision.executionPlan?.fillProbability),
@@ -1051,7 +1076,10 @@ export function summarizeExecutionAttribution({
       });
     }
     if (decision.strategyTags?.includes("BTC_MICRO_LONGSHOT")) {
-      applyStrategyLaneSample(bitcoinMicroLongshotLane, trade);
+      applyStrategyLaneSample(bitcoinMicroLongshotLane, trade, decision.btcMicroLongshot?.probabilityGap);
+    }
+    if (decision.strategyTags?.includes("SPORTS_UNDERDOG_ASYMMETRY")) {
+      applyStrategyLaneSample(sportsUnderdogLongshotLane, trade, decision.sportsUnderdogLongshot?.probabilityGap);
     }
   }
 
@@ -1344,16 +1372,16 @@ export function summarizeExecutionAttribution({
       return (b.conversionRate ?? 0) - (a.conversionRate ?? 0);
     });
 
-  const replacementPayloads = replacements
+  const replacementPayloads = filteredReplacements
     .map((event) => event.payload)
     .sort((a, b) => b.replacementScoreDelta - a.replacementScoreDelta);
   const replacementAccepted = replacementPayloads.filter((decision) => decision.accepted);
   const replacementRejected = replacementPayloads.filter((decision) => !decision.accepted);
 
-  const orderMaintenancePayloads = orderActions
+  const orderMaintenancePayloads = filteredOrderActions
     .map((event) => event.payload)
     .sort((a, b) => b.expectedImprovement - a.expectedImprovement);
-  const watchlistPayloads = [...watchlistEvents].sort(
+  const watchlistPayloads = [...filteredWatchlistEvents].sort(
     (a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
   );
   const latestWatchlistByKey = new Map<string, PredictionStorageEnvelope<StoredWatchlistEvent>>();
@@ -1379,18 +1407,18 @@ export function summarizeExecutionAttribution({
   const promotedResolved = resolvedWatchlistSamples.filter((sample) => sample.promoted);
   const neverPromotedResolved = resolvedWatchlistSamples.filter((sample) => !sample.promoted);
 
-  const latestLearningOutput = [...learningOutputs].sort(
+  const latestLearningOutput = [...filteredLearningOutputs].sort(
     (a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
   )[0]?.payload;
 
-  const liquidationPayloads = liquidationDecisions
+  const liquidationPayloads = filteredLiquidationDecisions
     .map((event) => event.payload)
     .sort((a, b) => (b.valueExitNowUsd - b.valueHoldToResolutionUsd) - (a.valueExitNowUsd - a.valueHoldToResolutionUsd));
 
-  const silentClockPayloads = signalOverlays
+  const silentClockPayloads = filteredSignalOverlays
     .map((event) => event.payload.silentClock)
     .filter((payload): payload is NonNullable<StoredSignalOverlayEvent["silentClock"]> => Boolean(payload));
-  const leadLagPayloads = signalOverlays
+  const leadLagPayloads = filteredSignalOverlays
     .map((event) => event.payload.leadLag)
     .filter((payload): payload is NonNullable<StoredSignalOverlayEvent["leadLag"]> => Boolean(payload));
   const recentTradeSlice = trades.slice(0, clamp(recentTradeLimit, 1, 200));
@@ -1421,11 +1449,50 @@ export function summarizeExecutionAttribution({
       byBootstrap: [],
       recentTrades: recentTradeSlice,
     },
+    trades,
     lookbackHours,
     maxBoost: 0.0025,
   });
+  const computedLearning = buildFalseNegativeLearning({
+    selectionControl: {
+      executed: {
+        count: placedExecutedDecisions.length,
+        avgEdge: executedAvgEdge,
+        avgExecutionAdjustedEdge: executedAvgExecutionAdjustedEdge,
+        avgConfidence: executedAvgConfidence,
+        avgCompositeScore: executedAvgCompositeScore,
+      },
+      nearMisses: {
+        count: nearMisses.length,
+        avgEdge: nearMissAvgEdge,
+        avgExecutionAdjustedEdge: nearMissAvgExecutionAdjustedEdge,
+        avgConfidence: nearMissAvgConfidence,
+        avgCompositeScore: nearMissAvgCompositeScore,
+        avgLatestQuoteDrift: nearMissAvgLatestQuoteDrift,
+      },
+      resolvedNearMisses: {
+        count: resolvedNearMissCount,
+        hitRate: average(resolvedNearMissHitCount, resolvedNearMissCount),
+        profitableRate: average(resolvedNearMissProfitableCount, resolvedNearMissCount),
+        avgCounterfactualPnlUsd: average(resolvedNearMissPnlSum, resolvedNearMissCount),
+        totalCounterfactualPnlUsd: resolvedNearMissCount > 0 ? roundNullable(resolvedNearMissPnlSum) : null,
+        avgExpiryDrift: average(resolvedNearMissExpiryDriftSum, resolvedNearMissExpiryDriftCount),
+        avgQuoteToExpiryDivergence: average(resolvedNearMissDivergenceSum, resolvedNearMissDivergenceCount),
+      },
+      falseNegativesByExpert: finalizeCounterfactualBuckets(falseNegativesByExpert, bucketLimit),
+      falseNegativesByCluster: finalizeCounterfactualBuckets(falseNegativesByCluster, bucketLimit),
+      falseNegativesByToxicity: finalizeCounterfactualBuckets(falseNegativesByToxicity, bucketLimit),
+      byGate,
+      gateWaterfall,
+      counterfactualByGate,
+      recentNearMisses,
+    },
+    lookbackHours,
+    active: latestLearningOutput?.active ?? false,
+  });
 
   return {
+    filteredRunId,
     generatedAt: new Date().toISOString(),
     lookbackHours,
     totals: {
@@ -1489,14 +1556,16 @@ export function summarizeExecutionAttribution({
       ),
       recent: watchlistPayloads.slice(0, clamp(recentTradeLimit, 1, 30)).map((event) => event.payload),
     },
-    learning:
-      latestLearningOutput ??
-      ({
-        generatedAt: new Date().toISOString(),
-        lookbackHours,
-        active: false,
-        recommendations: [],
-      } satisfies ExecutionAttributionSummary["learning"]),
+    learning: latestLearningOutput
+      ? {
+          ...computedLearning,
+          ...latestLearningOutput,
+          resolvedNearMissCount: computedLearning.resolvedNearMissCount,
+          gatesEvaluated: computedLearning.gatesEvaluated,
+          gatesMeetingMinSample: computedLearning.gatesMeetingMinSample,
+          gatesBlockedBySupport: computedLearning.gatesBlockedBySupport,
+        }
+      : computedLearning,
     liquidation: {
       hold: liquidationPayloads.filter((decision) => decision.action === "HOLD").length,
       trim: liquidationPayloads.filter((decision) => decision.action === "TRIM").length,
@@ -1528,6 +1597,7 @@ export function summarizeExecutionAttribution({
     },
     strategyLanes: {
       bitcoinMicroLongshot: finalizeStrategyLaneAccumulator(bitcoinMicroLongshotLane),
+      sportsUnderdogLongshot: finalizeStrategyLaneAccumulator(sportsUnderdogLongshotLane),
     },
     strategyPerformance: strategyPerformance ?? undefined,
     selectionControl: {
@@ -1568,6 +1638,7 @@ export function summarizeExecutionAttribution({
 
 export async function loadExecutionAttributionSummary(args?: {
   lookbackHours?: number;
+  runId?: string;
   recentTradeLimit?: number;
   bucketLimit?: number;
 }): Promise<ExecutionAttributionSummary> {
@@ -1605,6 +1676,7 @@ export async function loadExecutionAttributionSummary(args?: {
 
   return summarizeExecutionAttribution({
     lookbackHours,
+    runId: args?.runId,
     recentTradeLimit: args?.recentTradeLimit,
     bucketLimit: args?.bucketLimit,
     decisions,

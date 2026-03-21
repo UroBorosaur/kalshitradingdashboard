@@ -51,6 +51,7 @@ import {
   evaluateReplacementDecision,
   type OpenExposureConstraint as OpenPositionConstraint,
 } from "@/lib/prediction/replacement";
+import { evaluateSportsUnderdogLongshot } from "@/lib/prediction/sports-longshot";
 import { estimateLeadLagSignal, estimateSilentClockContribution } from "@/lib/prediction/signal-overlays";
 import { buildStrategyPerformanceProfile, evaluateStrategyPerformanceAdjustment } from "@/lib/prediction/strategy-performance";
 import { updateWatchlistLifecycle } from "@/lib/prediction/watchlist";
@@ -75,6 +76,7 @@ import type {
   ExecutionPlanRole,
   FalseNegativeLearningOutput,
   LeadLagSignal,
+  KalshiOrderLite,
   LiquidationDecision,
   OpportunityType,
   PortfolioRanking,
@@ -325,6 +327,18 @@ const BITCOIN_MICRO_LONGSHOT_MAX_TOXICITY = 0.48;
 const BITCOIN_MICRO_LONGSHOT_EXEC_EDGE_MIN = 0.0025;
 const BITCOIN_MICRO_LONGSHOT_FOCUS_SIZE_SCALE = 0.38;
 const BITCOIN_MICRO_LONGSHOT_OUTER_SIZE_SCALE = 0.28;
+const SPORTS_UNDERDOG_FOCUS_WINDOW_DAYS = 18 / 24;
+const SPORTS_UNDERDOG_MAX_WINDOW_DAYS = 3.5;
+const SPORTS_UNDERDOG_DEFAULT_MARKET_MAX = 0.45;
+const SPORTS_UNDERDOG_DEFAULT_MIN_GAP = 0.075;
+const SPORTS_UNDERDOG_MODEL_FLOOR = 0.24;
+const SPORTS_UNDERDOG_EDGE_MIN = 0.012;
+const SPORTS_UNDERDOG_CONFIDENCE_MIN = 0.34;
+const SPORTS_UNDERDOG_MAX_SPREAD = 0.12;
+const SPORTS_UNDERDOG_MIN_LIQUIDITY = 0.18;
+const SPORTS_UNDERDOG_CONFIRMATION_GAP_MIN = 0.025;
+const SPORTS_UNDERDOG_FOCUS_SIZE_SCALE = 0.34;
+const SPORTS_UNDERDOG_OUTER_SIZE_SCALE = 0.24;
 const BITCOIN_STOP_LOSS_PCT = 0.1;
 const BITCOIN_TAKE_PROFIT_PCT = 0.25;
 const UNCERTAINTY_QUOTE_WIDENING_ALPHA = 0.65;
@@ -369,6 +383,9 @@ const DEFAULT_AUTOMATION_CONTROLS: AutomationControls = {
   bitcoinMicroLongshotEnabled: true,
   bitcoinMicroLongshotMarketMax: BITCOIN_MICRO_LONGSHOT_DEFAULT_MARKET_MAX,
   bitcoinMicroLongshotMinGap: BITCOIN_MICRO_LONGSHOT_DEFAULT_MIN_GAP,
+  sportsUnderdogLongshotEnabled: true,
+  sportsUnderdogLongshotMarketMax: SPORTS_UNDERDOG_DEFAULT_MARKET_MAX,
+  sportsUnderdogLongshotMinGap: SPORTS_UNDERDOG_DEFAULT_MIN_GAP,
   throughputRecoveryEnabled: true,
   exploratoryFallbackEnabled: true,
   replacementEnabled: true,
@@ -544,6 +561,18 @@ function normalizeAutomationControls(input?: Partial<AutomationControls>): Autom
       0.005,
       0.12,
     ),
+    sportsUnderdogLongshotEnabled:
+      input?.sportsUnderdogLongshotEnabled ?? DEFAULT_AUTOMATION_CONTROLS.sportsUnderdogLongshotEnabled,
+    sportsUnderdogLongshotMarketMax: clamp(
+      input?.sportsUnderdogLongshotMarketMax ?? DEFAULT_AUTOMATION_CONTROLS.sportsUnderdogLongshotMarketMax,
+      0.18,
+      0.6,
+    ),
+    sportsUnderdogLongshotMinGap: clamp(
+      input?.sportsUnderdogLongshotMinGap ?? DEFAULT_AUTOMATION_CONTROLS.sportsUnderdogLongshotMinGap,
+      0.02,
+      0.18,
+    ),
     throughputRecoveryEnabled: input?.throughputRecoveryEnabled ?? DEFAULT_AUTOMATION_CONTROLS.throughputRecoveryEnabled,
     exploratoryFallbackEnabled: input?.exploratoryFallbackEnabled ?? DEFAULT_AUTOMATION_CONTROLS.exploratoryFallbackEnabled,
     replacementEnabled: input?.replacementEnabled ?? DEFAULT_AUTOMATION_CONTROLS.replacementEnabled,
@@ -648,6 +677,11 @@ function isKalshiMarketNotFoundError(error: unknown) {
   return message.includes("market_not_found") || message.includes("market not found");
 }
 
+function isKalshiOrderGroupLimitError(error: unknown) {
+  const message = String((error as Error | undefined)?.message ?? "").toLowerCase();
+  return message.includes("exceeded_order_group_contracts_limit") || message.includes("order group contracts limit");
+}
+
 function isTradableKalshiStatus(status: string | null | undefined) {
   const normalized = String(status ?? "").trim().toLowerCase();
   if (!normalized) return true;
@@ -699,6 +733,27 @@ function buildAutomationClientOrderId(runId: string, candidate: Pick<PredictionC
   const ticker = candidate.ticker.replace(/[^A-Za-z0-9]+/g, "").slice(0, 24);
   const side = candidate.side === "YES" ? "Y" : "N";
   return `auto-${compactRunId}-${index.toString(36)}-${side}-${ticker}`.slice(0, 48);
+}
+
+function parseOrderTimestampMs(value: string | undefined) {
+  if (!value) return null;
+  const ts = new Date(value).getTime();
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function estimateRecentOrderGroupContracts(orders: KalshiOrderLite[], nowMs = Date.now()) {
+  const out = new Map<string, number>();
+  const cutoffMs = nowMs - 15_000;
+  for (const order of orders) {
+    const groupId = order.order_group_id?.trim();
+    if (!groupId) continue;
+    const status = order.status.trim().toLowerCase();
+    if (["canceled", "cancelled", "rejected", "failed", "expired"].includes(status)) continue;
+    const createdMs = parseOrderTimestampMs(order.created_time) ?? parseOrderTimestampMs(order.last_update_time);
+    if (createdMs === null || createdMs < cutoffMs) continue;
+    out.set(groupId, (out.get(groupId) ?? 0) + Math.max(0, order.count));
+  }
+  return out;
 }
 
 function buildExecutionHealthContext(markoutPenalty: number, sampleCount: number) {
@@ -868,8 +923,16 @@ function candidateUtilityScore(candidate: PredictionCandidate, rules: ModeRules)
       clamp((candidate.btcMicroLongshot.probabilityGap - candidate.btcMicroLongshot.minGap) * 6, 0, 0.1) +
       (candidate.btcMicroLongshot.focusWindow ? 0.04 : 0.015)
     : 1;
+  const sportsUnderdogBonus = candidate.sportsUnderdogLongshot?.eligible
+    ? 1 +
+      clamp((candidate.sportsUnderdogLongshot.probabilityGap - candidate.sportsUnderdogLongshot.minGap) * 5, 0, 0.09) +
+      clamp((candidate.sportsUnderdogLongshot.equivalentPriceAdvantage ?? 0) * 3.5, 0, 0.08) +
+      (candidate.sportsUnderdogLongshot.focusWindow ? 0.035 : 0.012)
+    : 1;
   const strategyPerformanceLift = 1 + clamp((candidate.strategyPerformanceBoost ?? 0) * 25, -0.18, 0.18);
-  return (boundedKelly * executionLift * btcMicroLongshotBonus * strategyPerformanceLift) / (timePenalty * uncertaintyPenalty * toxicityPenalty);
+  return (
+    boundedKelly * executionLift * btcMicroLongshotBonus * sportsUnderdogBonus * strategyPerformanceLift
+  ) / (timePenalty * uncertaintyPenalty * toxicityPenalty);
 }
 
 function inferStructuralStrategyTags(market: PredictionMarketQuote): StrategyTag[] {
@@ -994,6 +1057,10 @@ function meetsGlobalHighProbabilityDefinition(args: {
 
 function isBitcoinMicroLongshotCandidate(candidate: PredictionCandidate) {
   return Boolean(candidate.btcMicroLongshot?.eligible) || candidate.strategyTags?.includes("BTC_MICRO_LONGSHOT");
+}
+
+function isSportsUnderdogLongshotCandidate(candidate: PredictionCandidate) {
+  return Boolean(candidate.sportsUnderdogLongshot?.eligible) || candidate.strategyTags?.includes("SPORTS_UNDERDOG_ASYMMETRY");
 }
 
 function filterExistingPositionCandidates(
@@ -2153,6 +2220,16 @@ function bitcoinMainstayScore(candidate: PredictionCandidate): number {
     ? clamp(candidate.btcMicroLongshot.probabilityGap * 1.6, 0.02, 0.12) + (candidate.btcMicroLongshot.focusWindow ? 0.06 : 0.025)
     : 0;
   return candidateUtilityScore(candidate, MODE_RULES.CONSERVATIVE) + microBonus + focusBonus + longshotBonus;
+}
+
+function sportsUnderdogMainstayScore(candidate: PredictionCandidate): number {
+  const horizon = Math.max(MIN_HORIZON_DAYS, candidate.timeToCloseDays ?? 30);
+  const focusBonus = candidate.sportsUnderdogLongshot?.focusWindow ? 0.06 : clamp((1 / horizon) - 0.25, 0, 0.08);
+  const asymmetryBonus = candidate.sportsUnderdogLongshot?.eligible
+    ? clamp(candidate.sportsUnderdogLongshot.probabilityGap * 1.2, 0.02, 0.12) +
+      clamp((candidate.sportsUnderdogLongshot.equivalentPriceAdvantage ?? 0) * 1.8, 0, 0.08)
+    : 0;
+  return candidateUtilityScore(candidate, MODE_RULES.CONSERVATIVE) + focusBonus + asymmetryBonus;
 }
 
 function classifyOpportunityType(
@@ -3405,6 +3482,11 @@ function candidateFromMarket(
   const quoteLiquidityBoost = quotePresence * 0.16 + (twoSidedBook ? 0.06 : 0) + bookTightnessBoost;
   const liquidityScore = clamp(Math.log1p(market.volume + market.openInterest) / 8 + quoteLiquidityBoost, 0.08, 1);
   const timeToCloseDays = Number(daysUntil(market.closeTime).toFixed(2));
+  const expectedHorizonDays = market.expectedExpirationTime ? Number(daysUntil(market.expectedExpirationTime).toFixed(2)) : null;
+  const sportsLongshotHorizonDays =
+    expectedHorizonDays !== null && Number.isFinite(expectedHorizonDays)
+      ? Math.min(timeToCloseDays, Math.max(0, expectedHorizonDays))
+      : timeToCloseDays;
   const isBtcMicro = market.category === "BITCOIN" && timeToCloseDays <= BITCOIN_MICRO_HORIZON_DAYS;
   const coherenceAdjustment = applyCoherenceAdjustment(market, chosenSide, mathContext);
   const syntheticBand = overlayContext.syntheticBandsByTicker.get(market.ticker) ?? null;
@@ -3523,6 +3605,41 @@ function candidateFromMarket(
   if (btcMicroLongshotPreQualified) {
     strategyTags.push("BTC_MICRO_LONGSHOT");
   }
+  const sportsUnderdogLongshotBase = evaluateSportsUnderdogLongshot({
+    enabled: controls.sportsUnderdogLongshotEnabled,
+    market,
+    relatedMarkets,
+    selectedSide: chosenSide,
+    timeToCloseDays: sportsLongshotHorizonDays,
+    modelProb: rulebookEstimate.prob,
+    marketProb: chosenMarketProb,
+    edge,
+    confidence,
+    spread,
+    liquidityScore,
+    marketProbabilityCeiling: controls.sportsUnderdogLongshotMarketMax,
+    minGap: controls.sportsUnderdogLongshotMinGap,
+    minEdge: Math.max(SPORTS_UNDERDOG_EDGE_MIN, rules.minEdge * 1.2),
+    minConfidence: Math.max(SPORTS_UNDERDOG_CONFIDENCE_MIN, confidenceRequired - 0.05),
+    maxSpread: Math.min(maxSpreadAllowed, SPORTS_UNDERDOG_MAX_SPREAD),
+    minLiquidityScore: Math.max(SPORTS_UNDERDOG_MIN_LIQUIDITY, minLiquidityRequired),
+    focusWindowDays: SPORTS_UNDERDOG_FOCUS_WINDOW_DAYS,
+    maxWindowDays: SPORTS_UNDERDOG_MAX_WINDOW_DAYS,
+    modelProbabilityFloor: SPORTS_UNDERDOG_MODEL_FLOOR,
+    confirmationGapMin: SPORTS_UNDERDOG_CONFIRMATION_GAP_MIN,
+    sizeScale: timeToCloseDays <= SPORTS_UNDERDOG_FOCUS_WINDOW_DAYS
+      ? SPORTS_UNDERDOG_FOCUS_SIZE_SCALE
+      : SPORTS_UNDERDOG_OUTER_SIZE_SCALE,
+  });
+  const sportsUnderdogPreQualified = sportsUnderdogLongshotBase?.eligible ?? false;
+  const sportsUnderdogLongshot = sportsUnderdogLongshotBase
+    ? {
+        ...sportsUnderdogLongshotBase,
+      }
+    : null;
+  if (sportsUnderdogPreQualified) {
+    strategyTags.push("SPORTS_UNDERDOG_ASYMMETRY");
+  }
 
   const globalHighProbability = meetsGlobalHighProbabilityDefinition({
     category: market.category,
@@ -3558,7 +3675,8 @@ function candidateFromMarket(
     !controls.highProbabilityEnabled ||
     globalHighProbability.qualified ||
     favoriteLongshotActive.autoExecute ||
-    btcMicroLongshotPreQualified;
+    btcMicroLongshotPreQualified ||
+    sportsUnderdogPreQualified;
 
   if (price <= 0.01 || price >= 0.99) return null;
   if (spread > maxSpreadAllowed || liquidityScore < minLiquidityRequired) return null;
@@ -3566,7 +3684,8 @@ function candidateFromMarket(
     favoriteLongshotActive.shouldFadeCheapYes &&
     coherenceAdjustment.coherenceEdge <= 0.01 &&
     !robustRulebookPass &&
-    !btcMicroLongshotPreQualified
+    !btcMicroLongshotPreQualified &&
+    !sportsUnderdogPreQualified
   ) return null;
   if (!highProbabilityQualified) return null;
 
@@ -3574,6 +3693,7 @@ function candidateFromMarket(
   let usedHighProbabilityLane = false;
   let usedFavoriteLongshotBias = false;
   let usedBitcoinMicroLongshot = false;
+  let usedSportsUnderdogLongshot = false;
   let usedRulebookArbitrage = false;
   let usedSyntheticOverlay = false;
   const primaryPass = highProbabilityQualified && edge >= minEdgeRequired && confidence >= confidenceRequired;
@@ -3584,12 +3704,28 @@ function candidateFromMarket(
       spread <= secondaryMaxSpread &&
       liquidityScore >= secondaryMinLiquidityScore;
 
-    if (!secondaryPass && !highProbLowEvPass && !favoriteLongshotActive.autoExecute && !btcMicroLongshotPreQualified) return null;
+    if (
+      !secondaryPass &&
+      !highProbLowEvPass &&
+      !favoriteLongshotActive.autoExecute &&
+      !btcMicroLongshotPreQualified &&
+      !sportsUnderdogPreQualified
+    ) return null;
     isSecondaryEntry = secondaryPass;
     usedHighProbabilityLane = !secondaryPass && highProbLowEvPass;
     usedFavoriteLongshotBias = !secondaryPass && !highProbLowEvPass && favoriteLongshotActive.autoExecute;
     usedBitcoinMicroLongshot =
-      !secondaryPass && !highProbLowEvPass && !favoriteLongshotActive.autoExecute && btcMicroLongshotPreQualified;
+      !secondaryPass &&
+      !highProbLowEvPass &&
+      !favoriteLongshotActive.autoExecute &&
+      !sportsUnderdogPreQualified &&
+      btcMicroLongshotPreQualified;
+    usedSportsUnderdogLongshot =
+      !secondaryPass &&
+      !highProbLowEvPass &&
+      !favoriteLongshotActive.autoExecute &&
+      !btcMicroLongshotPreQualified &&
+      sportsUnderdogPreQualified;
     usedRulebookArbitrage = false;
     usedSyntheticOverlay = false;
   }
@@ -3621,10 +3757,26 @@ function candidateFromMarket(
       btcMicroLongshotStakeCap,
     ),
   );
+  const sportsUnderdogStakeCap = Math.max(
+    price,
+    Math.min(
+      maxDailyRiskUsd * (sportsUnderdogLongshot?.focusWindow ? 0.14 : 0.1),
+      accountBalance * rules.perTradeRiskPct * (sportsUnderdogLongshot?.focusWindow ? 0.36 : 0.26),
+    ),
+  );
+  const sportsUnderdogStake = Math.max(
+    price,
+    Math.min(
+      baseStake * (sportsUnderdogLongshot?.sizeScale ?? SPORTS_UNDERDOG_OUTER_SIZE_SCALE),
+      sportsUnderdogStakeCap,
+    ),
+  );
   const plannedStake = usedHighProbabilityLane
     ? highProbabilityLaneStake
     : usedBitcoinMicroLongshot
       ? btcMicroLongshotStake
+    : usedSportsUnderdogLongshot
+      ? sportsUnderdogStake
     : isSecondaryEntry
       ? Math.max(price, baseStake * rules.secondaryStakeScale)
       : baseStake;
@@ -3743,7 +3895,14 @@ function candidateFromMarket(
       executionAdjustedEdge >= btcMicroLongshot.executionAdjustedEdgeFloor &&
       executionAlpha.toxicityScore <= btcMicroLongshot.maxToxicity,
   );
+  const sportsUnderdogExecutionPass = Boolean(
+    sportsUnderdogLongshot &&
+      sportsUnderdogLongshot.eligible &&
+      executionAdjustedEdge >= 0.004 &&
+      executionAlpha.toxicityScore <= 0.55,
+  );
   if (usedBitcoinMicroLongshot && !btcMicroLongshotExecutionPass) return null;
+  if (usedSportsUnderdogLongshot && !sportsUnderdogExecutionPass) return null;
   const netAlphaUsd =
     probabilityAlphaUsd -
     feeEstimate.totalUsd +
@@ -3804,6 +3963,13 @@ function candidateFromMarket(
   if (leadLagContribution?.probabilityDelta) {
     rationale.push(
       `Lead-lag overlay contribution ${(leadLagContribution.probabilityDelta * 100).toFixed(2)} pts to selected-side probability and ${(leadLagContribution.scoreContribution ?? 0).toFixed(5)} to capital-time score.`,
+    );
+  }
+  if (sportsUnderdogLongshot?.eligible) {
+    rationale.push(
+      `Sports underdog asymmetry lane: gap ${(sportsUnderdogLongshot.probabilityGap * 100).toFixed(2)} pts, counterpart ${sportsUnderdogLongshot.counterpartTicker ?? "n/a"} advantage ${((
+        sportsUnderdogLongshot.equivalentPriceAdvantage ?? 0
+      ) * 100).toFixed(2)} pts.`,
     );
   }
   rationale.push(
@@ -4038,6 +4204,13 @@ function candidateFromMarket(
     toxicityScore: Number(executionAlpha.toxicityScore.toFixed(6)),
     riskCluster,
     btcMicroLongshot: btcMicroLongshot ?? undefined,
+    sportsUnderdogLongshot:
+      sportsUnderdogLongshot
+        ? {
+            ...sportsUnderdogLongshot,
+            stakeCapUsd: Number(sportsUnderdogStakeCap.toFixed(4)),
+          }
+        : undefined,
     silentClock: silentClockContribution ?? undefined,
     leadLag: leadLagContribution ?? undefined,
     executionPlan: {
@@ -4079,6 +4252,8 @@ function candidateFromMarket(
       ? "Favorite-longshot bias execution candidate: model-implied gap cleared the 10-point trigger."
       : usedBitcoinMicroLongshot
       ? "BTC micro longshot candidate: low-implied BTC side cleared dedicated gap/spread/toxicity filters with capped sizing."
+      : usedSportsUnderdogLongshot
+      ? "Sports underdog asymmetry candidate: cheap winner exposure cleared dedicated model-gap and counterpart-price confirmation filters."
       : usedHighProbabilityLane
       ? watchlistExecutionEligible
         ? "High-probability lane promoted from watchlist to live-eligible execution."
@@ -4157,6 +4332,16 @@ function selectDiversifiedCandidates(
     }
     if (preferredBtcLongshot) {
       addCandidate(preferredBtcLongshot);
+    }
+  }
+
+  if (categories.includes("SPORTS")) {
+    const sportsCandidates = sorted.filter((candidate) => isSportsUnderdogLongshotCandidate(candidate));
+    const preferredSportsLongshot = sportsCandidates
+      .sort((a, b) => sportsUnderdogMainstayScore(b) - sportsUnderdogMainstayScore(a))[0];
+
+    if (preferredSportsLongshot) {
+      addCandidate(preferredSportsLongshot);
     }
   }
 
@@ -4936,12 +5121,13 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   }).catch(() => null);
   const strategyPerformanceProfile = buildStrategyPerformanceProfile({
     attribution: priorAttribution,
+    trades: priorAttribution?.recentTrades,
     lookbackHours: strategyPerformanceLookbackHours,
     maxBoost: controls.strategyPerformanceMaxBoost,
   });
   const learningOutput = priorAttribution
     ? buildFalseNegativeLearning({
-        attribution: priorAttribution,
+        selectionControl: priorAttribution.selectionControl,
         lookbackHours: 72,
         active: controls.adaptiveLearningEnabled,
       })
@@ -5451,6 +5637,20 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       warnings.push(`Order-group guard setup failed: ${(error as Error).message}`);
     }
   }
+  const recentOrderGroupContracts = estimateRecentOrderGroupContracts(existingOrders);
+  const knownOrderGroupLimits = new Map(
+    [...clusterGuards.values()]
+      .filter((guard) => guard.orderGroupId)
+      .map((guard) => [guard.orderGroupId as string, guard.contractsLimit] as const),
+  );
+
+  function projectedOrderGroupUsage(orderGroupId: string, additionalContracts: number) {
+    return (recentOrderGroupContracts.get(orderGroupId) ?? 0) + Math.max(0, additionalContracts);
+  }
+
+  function reserveOrderGroupContracts(orderGroupId: string, contracts: number) {
+    recentOrderGroupContracts.set(orderGroupId, projectedOrderGroupUsage(orderGroupId, contracts));
+  }
 
   const executedCandidates: PredictionCandidate[] = [];
   const actionableKeys = new Set(actionable.map((candidate) => candidateKey(candidate)));
@@ -5527,6 +5727,17 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         await cancelKalshiDemoOrder(decision.orderId);
         if (decision.action === "REPRICE" && decision.suggestedPriceCents !== null) {
           const count = incumbentOrder.remaining_count ?? incumbentOrder.count;
+          const groupId = incumbentOrder.order_group_id?.trim();
+          const groupLimit = groupId ? knownOrderGroupLimits.get(groupId) : undefined;
+          if (groupId && typeof groupLimit === "number") {
+            const projected = projectedOrderGroupUsage(groupId, count);
+            if (projected > groupLimit + 1e-9) {
+              warnings.push(
+                `Order maintenance reprice blocked locally for ${decision.ticker}: projected order-group usage ${projected.toFixed(2)} exceeds 15s limit ${groupLimit}.`,
+              );
+              continue;
+            }
+          }
           await placeKalshiDemoOrder({
             ticker: incumbentOrder.ticker,
             side,
@@ -5536,6 +5747,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
             orderGroupId: incumbentOrder.order_group_id,
             clientOrderId: buildAutomationClientOrderId(runId, { ticker: incumbentOrder.ticker, side }, 9000 + orderMaintenanceHandledKeys.size),
           });
+          if (groupId) reserveOrderGroupContracts(groupId, count);
           orderMaintenanceHandledKeys.add(`${incumbentOrder.ticker}:${side}`);
         }
       } catch (error) {
@@ -5723,15 +5935,14 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
 
     try {
       let executionCandidate = candidate;
-      let tradableQuote = await confirmTradableMarket(executionCandidate.ticker);
-      if (!tradableQuote && executionCandidate.category === "BITCOIN") {
+      if (executionCandidate.category === "BITCOIN") {
         const refreshedCandidate = await refreshBitcoinExecutionCandidate(executionCandidate);
-        if (refreshedCandidate) {
+        if (refreshedCandidate && refreshedCandidate.ticker !== executionCandidate.ticker) {
           executionCandidate = refreshedCandidate;
-          tradableQuote = await confirmTradableMarket(executionCandidate.ticker);
-          warnings.push(`Retargeted stale BTC candidate ${candidate.ticker} to live market ${executionCandidate.ticker} before placement.`);
+          warnings.push(`Retargeted BTC candidate ${candidate.ticker} to live market ${executionCandidate.ticker} before placement.`);
         }
       }
+      const tradableQuote = await confirmTradableMarket(executionCandidate.ticker);
       if (!tradableQuote) {
         executedCandidates.push({
           ...executionCandidate,
@@ -5746,6 +5957,29 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
       }
       if (executionCandidate.incumbentComparison?.accepted && executionCandidate.incumbentComparison.action === "REPLACE_ORDER" && executionCandidate.incumbentComparison.incumbentOrderId) {
         await cancelKalshiDemoOrder(executionCandidate.incumbentComparison.incumbentOrderId);
+      }
+      const projectedGroupContracts = projectedOrderGroupUsage(clusterGuard.orderGroupId, executionCandidate.recommendedContracts);
+      if (projectedGroupContracts > clusterGuard.contractsLimit + 1e-9) {
+        executedCandidates.push({
+          ...executionCandidate,
+          gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(executionCandidate), {
+            gate: "ORDER_GROUP_BRAKE",
+            passed: false,
+            observed: Number(projectedGroupContracts.toFixed(4)),
+            threshold: clusterGuard.contractsLimit,
+            missBy: Number((projectedGroupContracts - clusterGuard.contractsLimit).toFixed(4)),
+            unit: "count",
+            detail: `Projected 15s order-group usage ${projectedGroupContracts.toFixed(2)} exceeds limit ${clusterGuard.contractsLimit}.`,
+          }),
+          ...executionMetadata,
+          simulated: true,
+          executionStatus: "SKIPPED",
+          executionMessage: `Blocked locally: projected 15s order-group usage ${projectedGroupContracts.toFixed(2)} exceeds limit ${clusterGuard.contractsLimit} for cluster ${clusterKey}.`,
+        });
+        warnings.push(
+          `Blocked ${executionCandidate.ticker} locally: projected order-group usage ${projectedGroupContracts.toFixed(2)} exceeds limit ${clusterGuard.contractsLimit}.`,
+        );
+        continue;
       }
       const clientOrderId = buildAutomationClientOrderId(runId, executionCandidate, index);
       const placement = await placeKalshiDemoOrder({
@@ -5766,6 +6000,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
         String(placementRecord.client_order_id ?? clientOrderId ?? "").trim() || clientOrderId;
 
       executedStake += executionCandidate.recommendedStakeUsd;
+      reserveOrderGroupContracts(clusterGuard.orderGroupId, executionCandidate.recommendedContracts);
 
       executedCandidates.push({
         ...executionCandidate,
@@ -5784,6 +6019,27 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
           const refreshedCandidate = await refreshBitcoinExecutionCandidate(candidate);
           if (refreshedCandidate && refreshedCandidate.ticker !== candidate.ticker) {
             const refreshedClientOrderId = buildAutomationClientOrderId(runId, refreshedCandidate, index);
+            const projectedGroupContracts = projectedOrderGroupUsage(clusterGuard.orderGroupId, refreshedCandidate.recommendedContracts);
+            if (projectedGroupContracts > clusterGuard.contractsLimit + 1e-9) {
+              executedCandidates.push({
+                ...refreshedCandidate,
+                gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(refreshedCandidate), {
+                  gate: "ORDER_GROUP_BRAKE",
+                  passed: false,
+                  observed: Number(projectedGroupContracts.toFixed(4)),
+                  threshold: clusterGuard.contractsLimit,
+                  missBy: Number((projectedGroupContracts - clusterGuard.contractsLimit).toFixed(4)),
+                  unit: "count",
+                  detail: `Projected 15s order-group usage ${projectedGroupContracts.toFixed(2)} exceeds limit ${clusterGuard.contractsLimit} after BTC retarget.`,
+                }),
+                ...executionMetadata,
+                simulated: true,
+                executionStatus: "SKIPPED",
+                executionClientOrderId: refreshedClientOrderId,
+                executionMessage: `Blocked locally after BTC retarget: projected 15s order-group usage ${projectedGroupContracts.toFixed(2)} exceeds limit ${clusterGuard.contractsLimit}.`,
+              });
+              continue;
+            }
             try {
               const retryPlacement = await placeKalshiDemoOrder({
                 ticker: refreshedCandidate.ticker,
@@ -5799,6 +6055,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
                   ? (retryPlacement.order as Record<string, unknown>)
                   : (retryPlacement as Record<string, unknown>);
               executedStake += refreshedCandidate.recommendedStakeUsd;
+              reserveOrderGroupContracts(clusterGuard.orderGroupId, refreshedCandidate.recommendedContracts);
               executedCandidates.push({
                 ...refreshedCandidate,
                 gateDiagnostics: withRuntimeGateDiagnostics(refreshedCandidate),
@@ -5813,6 +6070,26 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
               warnings.push(`Recovered BTC market_not_found by retargeting ${candidate.ticker} to ${refreshedCandidate.ticker}.`);
               continue;
             } catch (retryError) {
+              if (isKalshiOrderGroupLimitError(retryError)) {
+                executedCandidates.push({
+                  ...refreshedCandidate,
+                  gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(refreshedCandidate), {
+                    gate: "ORDER_GROUP_BRAKE",
+                    passed: false,
+                    observed: Number(projectedGroupContracts.toFixed(4)),
+                    threshold: clusterGuard.contractsLimit,
+                    missBy: Number(Math.max(0, projectedGroupContracts - clusterGuard.contractsLimit).toFixed(4)),
+                    unit: "count",
+                    detail: `Exchange rejected BTC retargeted placement because order-group ${clusterGuard.orderGroupId} exceeded its 15s contracts limit.`,
+                  }),
+                  ...executionMetadata,
+                  simulated: true,
+                  executionStatus: "SKIPPED",
+                  executionClientOrderId: refreshedClientOrderId,
+                  executionMessage: `Blocked by exchange order-group limit after BTC retarget for cluster ${clusterKey}.`,
+                });
+                continue;
+              }
               if (!isKalshiMarketNotFoundError(retryError)) {
                 executedCandidates.push({
                   ...refreshedCandidate,
@@ -5838,6 +6115,28 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
           executionMessage: `Market ${candidate.ticker} disappeared between scan and placement; skipped instead of retrying stale ticker.`,
         });
         warnings.push(`Skipped ${candidate.ticker}: Kalshi reported market_not_found during live placement.`);
+        continue;
+      }
+      if (isKalshiOrderGroupLimitError(error)) {
+        const projectedGroupContracts = projectedOrderGroupUsage(clusterGuard.orderGroupId, candidate.recommendedContracts);
+        executedCandidates.push({
+          ...candidate,
+          gateDiagnostics: upsertGateDiagnostic(withRuntimeGateDiagnostics(candidate), {
+            gate: "ORDER_GROUP_BRAKE",
+            passed: false,
+            observed: Number(projectedGroupContracts.toFixed(4)),
+            threshold: clusterGuard.contractsLimit,
+            missBy: Number(Math.max(0, projectedGroupContracts - clusterGuard.contractsLimit).toFixed(4)),
+            unit: "count",
+            detail: `Exchange rejected placement because order-group ${clusterGuard.orderGroupId} exceeded its 15s contracts limit.`,
+          }),
+          ...executionMetadata,
+          simulated: true,
+          executionStatus: "SKIPPED",
+          executionClientOrderId: clientOrderId,
+          executionMessage: `Blocked by exchange order-group limit for cluster ${clusterKey}; skipped locally after rejection.`,
+        });
+        warnings.push(`Skipped ${candidate.ticker}: exchange order-group limit hit for cluster ${clusterKey}.`);
         continue;
       }
       executedCandidates.push({
@@ -5908,6 +6207,7 @@ export async function runPredictionAutomation(input: AutomationRunInput): Promis
   const portfolioRanking = mode === "AI" ? buildPortfolioRanking(rankingUniverse) : undefined;
 
   return {
+    runId,
     mode,
     executed: canExecuteLive,
     simulated: !canExecuteLive,
